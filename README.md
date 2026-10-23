@@ -94,6 +94,9 @@ connections. Notification alerts are **off by default**; when you turn them on, 
 reads new notifications on your PC only to tell whether one arrived or a call is ringing —
 nothing is stored or sent anywhere.
 
+Your settings and remembered strip live in `%APPDATA%\RGBZap` — delete that folder to
+reset RGBZap.
+
 ## Notes
 - **DRM video** (Netflix, Disney+, etc.) captures as **black** on Windows, so Screen Sync
   can't read it and fades to a dim glow. Local players, browsers, and YouTube work.

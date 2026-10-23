@@ -26,6 +26,25 @@ dave-code-ruiz/elkbledom (models.json).
 Frames, effect codes, name prefixes and UUIDs are based on dave-code-ruiz/elkbledom,
 MIT License, Copyright (c) 2019 — full notice in THIRD_PARTY_NOTICES.md.
 """
+import os
+import shutil
+
+# Per-user data folder (settings, remembered strip). Not next to the program: an
+# installed app in Program Files can't write there.
+APP_DIR = os.path.join(os.environ.get("APPDATA") or
+                       os.path.join(os.path.expanduser("~"), ".config"), "RGBZap")
+
+
+def data_file(name, legacy=None):
+    """Path of `name` in APP_DIR. On first use, copies `legacy` (where versions
+    before 1.0 kept the file, next to the program) so nothing is lost on upgrade.
+    Copy, not move: the old file stays as a backup."""
+    os.makedirs(APP_DIR, exist_ok=True)
+    path = os.path.join(APP_DIR, name)
+    if legacy and not os.path.exists(path) and os.path.exists(legacy):
+        shutil.copy2(legacy, path)
+    return path
+
 
 # Advertised-name prefixes we treat as controllable strips (lower-case).
 NAME_PREFIXES = (
@@ -116,6 +135,25 @@ def _selftest():
     c = Client([Ch("0000fff4-...", ["notify", "read"])])
     assert asyncio.run(pick_write_char(c)) is None
     print("OK  pick_write_char preference + fallback + unsupported")
+
+    # data_file: copies the pre-1.0 file once, never overwrites newer data
+    import tempfile
+    global APP_DIR
+    real, tmp = APP_DIR, tempfile.mkdtemp()
+    APP_DIR = os.path.join(tmp, "RGBZap")
+    try:
+        old = os.path.join(tmp, "elk_settings.json")
+        with open(old, "w") as f:
+            f.write("old")
+        p = data_file("settings.json", legacy=old)
+        assert open(p).read() == "old" and os.path.exists(old), "legacy not copied"
+        with open(p, "w") as f:
+            f.write("new")
+        assert open(data_file("settings.json", legacy=old)).read() == "new", "overwrote"
+        assert not os.path.exists(data_file("address.txt", legacy=os.path.join(tmp, "x")))
+    finally:
+        APP_DIR = real
+    print("OK  data_file: legacy copied once, newer data kept, missing legacy ok")
 
 
 if __name__ == "__main__":

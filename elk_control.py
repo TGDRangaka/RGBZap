@@ -17,7 +17,8 @@ Usage:
     python elk_control.py bright 50            # brightness 0-100
     python elk_control.py demo                 # on -> cycle a few colors -> off
 
-The address is remembered in elk_address.txt after the first successful scan,
+The address is remembered in %APPDATA%/RGBZap/address.txt (shared with the GUI)
+after the first successful scan,
 so you normally don't need to pass it. You can also set it explicitly:
     python elk_control.py --address XX:XX:XX:XX:XX:XX on
 """
@@ -28,9 +29,11 @@ from bleak import BleakScanner, BleakClient
 from bleak.exc import BleakError
 
 from elk_protocol import (is_strip_name, pick_write_char, cmd_on, cmd_off,
-                          cmd_color, cmd_white, cmd_bright)
+                          cmd_color, cmd_white, cmd_bright, data_file)
 
-ADDR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "elk_address.txt")
+# shared with the GUI: %APPDATA%\RGBZap\address.txt
+ADDR_FILE = data_file("address.txt", legacy=os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "elk_address.txt"))
 
 
 async def find_device(timeout=8.0):

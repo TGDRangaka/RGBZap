@@ -38,7 +38,8 @@ import numpy as np
 from bleak import BleakScanner, BleakClient
 
 from elk_protocol import (NAME_PREFIXES, EFFECTS, is_strip_name, pick_write_char,
-                          cmd_on, cmd_off, cmd_color, cmd_effect, cmd_effect_speed)
+                          cmd_on, cmd_off, cmd_color, cmd_effect, cmd_effect_speed,
+                          data_file)
 
 try:
     import winreg  # Windows only — used for the "run at startup" option
@@ -58,7 +59,8 @@ try:
 except ImportError:
     pystray = None                     # no tray: closing the window quits, as before
 
-ADDR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "elk_address.txt")
+_HERE = os.path.dirname(os.path.abspath(__file__))     # where pre-1.0 versions kept data
+ADDR_FILE = data_file("address.txt", legacy=os.path.join(_HERE, "elk_address.txt"))
 # logo / icons; inside the built exe they're unpacked under sys._MEIPASS
 ASSETS = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))),
                       "assets")
@@ -315,7 +317,7 @@ def builtin_preview(name, t):
 
 
 # ---- persisted settings (restored on next launch) ----
-SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "elk_settings.json")
+SETTINGS_FILE = data_file("settings.json", legacy=os.path.join(_HERE, "elk_settings.json"))
 DEFAULT_SETTINGS = {
     "color": [255, 255, 255], "brightness": 100, "mode": "color",
     "effect": list(EFFECTS)[0], "speed": 50,
