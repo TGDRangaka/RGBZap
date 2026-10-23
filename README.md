@@ -113,4 +113,5 @@ The strip protocol comes from the excellent
 integration (MIT) — see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). RGBZap is a
 standalone desktop app built on the same frames.
 
-RGBZap is MIT licensed — see [LICENSE](LICENSE).
+Made by [Dilshan Rangaka](https://dilshan-rangaka.vercel.app/). RGBZap is MIT licensed —
+see [LICENSE](LICENSE).

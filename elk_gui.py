@@ -31,6 +31,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from tkinter import messagebox, simpledialog, ttk
 
 import numpy as np
@@ -61,6 +62,9 @@ ADDR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "elk_addres
 # logo / icons; inside the built exe they're unpacked under sys._MEIPASS
 ASSETS = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))),
                       "assets")
+APP_VERSION = "1.0.0"
+APP_URL = "https://github.com/TGDRangaka/RGBZap"
+AUTHOR_URL = "https://dilshan-rangaka.vercel.app/"
 LOCK_PORT = 49731  # arbitrary localhost port used as a single-instance lock
 # Pace BLE writes to the strip's measured sustainable rate (~13/s ceiling).
 # 80ms => ~12.5/s, safely under the ceiling so the send buffer never backs up.
@@ -1581,6 +1585,20 @@ class App:
                      font=FONT_BODY, fg=MUTE, bg=PANEL, anchor="w").pack(fill="x", pady=(6, 0))
         self.on_notify_toggle()
 
+        # about footer, pinned to the bottom of the tab
+        about = tk.Frame(system, bg=PANEL)
+        about.pack(side="bottom", fill="x")
+        tk.Frame(about, bg=LINE, height=1).pack(fill="x", pady=(0, 10))
+        tk.Label(about, text=f"RGBZAP {APP_VERSION}", font=FONT_EYE, fg=MUTE, bg=PANEL,
+                 anchor="w").pack(fill="x")
+        by = tk.Frame(about, bg=PANEL)
+        by.pack(fill="x", pady=(2, 0))
+        tk.Label(by, text="© 2026", font=FONT_BODY, fg=TEXT, bg=PANEL).pack(side="left")
+        self._link(by, "Dilshan Rangaka", AUTHOR_URL).pack(side="left")
+        tk.Label(by, text="· Free and open source (MIT)", font=FONT_BODY, fg=TEXT, bg=PANEL
+                 ).pack(side="left")
+        self._link(about, APP_URL.removeprefix("https://"), APP_URL).pack(anchor="w")
+
         # lock a consistent width; let height be resized (min keeps it usable)
         root.update_idletasks()
         width = max(380, root.winfo_reqwidth())
@@ -1713,6 +1731,15 @@ class App:
             b.bind("<Enter>", lambda e: b.config(bg=hover))
             b.bind("<Leave>", lambda e: b.config(bg=bg))
         return b
+
+    def _link(self, parent, text, url):
+        """Blue text that opens url in the browser; underlines on hover."""
+        lb = tk.Label(parent, text=text, font=FONT_BODY, fg=SYNC_BLUE, bg=PANEL,
+                      cursor="hand2")
+        lb.bind("<Button-1>", lambda _e: webbrowser.open(url))
+        lb.bind("<Enter>", lambda _e: lb.config(font=FONT_BODY + ("underline",)))
+        lb.bind("<Leave>", lambda _e: lb.config(font=FONT_BODY))
+        return lb
 
     def _check(self, parent, text, var, cmd):
         cb = tk.Checkbutton(parent, text=text, variable=var, command=cmd, anchor="w",
