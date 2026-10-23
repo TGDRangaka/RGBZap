@@ -45,8 +45,12 @@ Bluetooth LE.
 ## Install
 
 ### Download (no Python needed)
-Grab the latest `RGBZap-windows.zip` from [Releases](../../releases), unzip anywhere, and
-run **`RGBZap.exe`**.
+From the latest [Release](../../releases), grab either:
+
+- **`RGBZap-Setup-<version>.exe`** — the installer. No admin rights needed; adds a Start
+  menu entry, an optional desktop shortcut, optional start-with-Windows, and a normal
+  uninstaller (Settings › Apps).
+- **`RGBZap-<version>-windows.zip`** — portable. Unzip anywhere and run **`RGBZap.exe`**.
 
 > **"Windows protected your PC"?** RGBZap is new and not code-signed yet, so SmartScreen
 > doesn't recognize it. Click **More info → Run anyway**. The full source is right here if
@@ -108,7 +112,10 @@ reset RGBZap.
 py -m pip install -r requirements-dev.txt
 build.bat
 ```
-Produces `dist\RGBZap\RGBZap.exe`. Zip the `dist\RGBZap` folder to share it.
+Produces in `dist\`: the `RGBZap\` app folder, a portable `RGBZap-<version>-windows.zip`,
+and — if [Inno Setup 6](https://jrsoftware.org/isinfo.php) is installed
+(`winget install JRSoftware.InnoSetup`) — the `RGBZap-Setup-<version>.exe` installer.
+The version comes from `APP_VERSION` in `elk_gui.py`.
 
 ## Credits
 The strip protocol comes from the excellent
