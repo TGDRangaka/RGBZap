@@ -1,3 +1,10 @@
 bleak>=0.22
 mss>=9
 numpy>=1.26
+pystray>=0.19
+Pillow>=10
+soundcard>=0.4
+# notification / call alerts (Windows only)
+winrt-Windows.UI.Notifications>=3.2; sys_platform == "win32"
+winrt-Windows.UI.Notifications.Management>=3.2; sys_platform == "win32"
+winrt-Windows.ApplicationModel>=3.2; sys_platform == "win32"

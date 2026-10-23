@@ -1,0 +1,12 @@
+# local, machine-specific
+elk_address.txt
+elk_settings.json
+*.lnk
+
+# python / build artifacts
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+*.stackdump

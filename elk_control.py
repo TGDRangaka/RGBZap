@@ -27,26 +27,16 @@ import os
 from bleak import BleakScanner, BleakClient
 from bleak.exc import BleakError
 
-WRITE_UUID = "0000fff3-0000-1000-8000-00805f9b34fb"
-NAME_PREFIXES = ("elk-bledom", "elk-bledob", "elk-bleddm", "melk", "ledble", "elk-ble")
-ADDR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "elk_address.txt")
+from elk_protocol import (is_strip_name, pick_write_char, cmd_on, cmd_off,
+                          cmd_color, cmd_white, cmd_bright)
 
-# --- Command builders (classic ELK-BLEDOM 0x7e..0xef 9-byte frames) ---
-def cmd_on():        return bytes([0x7e, 0x00, 0x04, 0xf0, 0x00, 0x01, 0xff, 0x00, 0xef])
-def cmd_off():       return bytes([0x7e, 0x00, 0x04, 0x00, 0x00, 0x00, 0xff, 0x00, 0xef])
-def cmd_color(r,g,b):return bytes([0x7e, 0x00, 0x05, 0x03, r & 0xff, g & 0xff, b & 0xff, 0x00, 0xef])
-def cmd_white(pct):  return bytes([0x7e, 0x00, 0x01, pct & 0xff, 0x00, 0x00, 0x00, 0x00, 0xef])
-def cmd_bright(pct): return bytes([0x7e, 0x00, 0x01, pct & 0xff, 0x00, 0x00, 0x00, 0x00, 0xef])
+ADDR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "elk_address.txt")
 
 
 async def find_device(timeout=8.0):
     print(f"Scanning for ELK-BLEDOM devices ({timeout:.0f}s)...")
     devices = await BleakScanner.discover(timeout=timeout)
-    matches = []
-    for d in devices:
-        name = (d.name or "").lower()
-        if any(name.startswith(p) for p in NAME_PREFIXES):
-            matches.append(d)
+    matches = [d for d in devices if is_strip_name(d.name)]
     return matches, devices
 
 
@@ -86,14 +76,25 @@ async def send(address, payloads):
     print(f"Locating {address}...")
     target = await BleakScanner.find_device_by_address(address, timeout=12.0)
     if target is None:
-        print("Strip not advertising. Make sure it's powered on and the duoCo")
-        print("Strip phone app is fully closed (only one connection at a time).")
-        return
+        # cached address may be stale/shared — rescan and try the found strip.
+        print("Cached address not advertising, rescanning...")
+        address = await cmd_scan()
+        if not address:
+            return
+        target = await BleakScanner.find_device_by_address(address, timeout=12.0)
+        if target is None:
+            print("Strip not advertising. Make sure it's powered on and the phone")
+            print("app is fully closed (only one connection at a time).")
+            return
     print(f"Connecting to {address}...")
     async with BleakClient(target, timeout=20.0) as client:
         print("Connected.")
+        write_uuid = await pick_write_char(client)
+        if write_uuid is None:
+            print("This strip model isn't supported yet (no writable characteristic).")
+            return
         for p in payloads:
-            await client.write_gatt_char(WRITE_UUID, p, response=False)
+            await client.write_gatt_char(write_uuid, p, response=False)
             print("  sent:", " ".join(f"{b:02x}" for b in p))
             await asyncio.sleep(0.15)
     print("Done.")

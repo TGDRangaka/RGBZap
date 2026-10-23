@@ -1,0 +1,3 @@
+# build tooling (only needed to produce the .exe, not to run from source)
+-r requirements.txt
+pyinstaller>=6.0

@@ -22,62 +22,60 @@ Run:  python elk_gui.py
 """
 import asyncio
 import colorsys
+import json
+import math
 import os
+import re
 import socket
 import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import colorchooser, messagebox, ttk
+from tkinter import messagebox, simpledialog, ttk
 
 import numpy as np
 from bleak import BleakScanner, BleakClient
+
+from elk_protocol import (NAME_PREFIXES, EFFECTS, is_strip_name, pick_write_char,
+                          cmd_on, cmd_off, cmd_color, cmd_effect, cmd_effect_speed)
 
 try:
     import winreg  # Windows only — used for the "run at startup" option
 except ImportError:
     winreg = None
 
-WRITE_UUID = "0000fff3-0000-1000-8000-00805f9b34fb"
-NAME_PREFIXES = ("elk-bledom", "elk-bledob", "elk-bleddm", "melk", "ledble", "elk-ble")
+try:  # Windows notification center (pip install winrt-Windows.UI.Notifications.Management)
+    from winrt.windows.ui.notifications import NotificationKinds, KnownNotificationBindings
+    from winrt.windows.ui.notifications.management import (
+        UserNotificationListener, UserNotificationListenerAccessStatus)
+except ImportError:
+    UserNotificationListener = None    # no notification alerts; toggles show disabled
+
+try:
+    import pystray                     # system tray icon (pip install pystray)
+    from PIL import Image, ImageDraw
+except ImportError:
+    pystray = None                     # no tray: closing the window quits, as before
+
 ADDR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "elk_address.txt")
+# logo / icons; inside the built exe they're unpacked under sys._MEIPASS
+ASSETS = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))),
+                      "assets")
 LOCK_PORT = 49731  # arbitrary localhost port used as a single-instance lock
 # Pace BLE writes to the strip's measured sustainable rate (~13/s ceiling).
 # 80ms => ~12.5/s, safely under the ceiling so the send buffer never backs up.
 SEND_INTERVAL = 0.08
 
-# ---- protocol frames (classic ELK-BLEDOM 9-byte 0x7e..0xef) ----
-def cmd_on():          return bytes([0x7e, 0x00, 0x04, 0xf0, 0x00, 0x01, 0xff, 0x00, 0xef])
-def cmd_off():         return bytes([0x7e, 0x00, 0x04, 0x00, 0x00, 0x00, 0xff, 0x00, 0xef])
-def cmd_color(r, g, b):return bytes([0x7e, 0x00, 0x05, 0x03, r & 0xff, g & 0xff, b & 0xff, 0x00, 0xef])
-def cmd_effect(v):     return bytes([0x7e, 0x00, 0x03, v & 0xff, 0x03, 0x00, 0x00, 0x00, 0xef])
-def cmd_effect_speed(v):return bytes([0x7e, 0x00, 0x02, v & 0xff, 0x00, 0x00, 0x00, 0x00, 0xef])
 
-# effect name -> value (from definitions.json, EFFECTS class)
-EFFECTS = {
-    "Jump RGB": 135,
-    "Jump 7-color": 136,
-    "Crossfade Red": 139,
-    "Crossfade Green": 140,
-    "Crossfade Blue": 141,
-    "Crossfade Yellow": 142,
-    "Crossfade Cyan": 143,
-    "Crossfade Magenta": 144,
-    "Crossfade White": 145,
-    "Crossfade Red-Green": 146,
-    "Crossfade Red-Blue": 147,
-    "Crossfade Green-Blue": 148,
-    "Crossfade RGB": 137,
-    "Crossfade 7-color": 138,
-    "Blink Red": 150,
-    "Blink Green": 151,
-    "Blink Blue": 152,
-    "Blink Yellow": 153,
-    "Blink Cyan": 154,
-    "Blink Magenta": 155,
-    "Blink White": 156,
-    "Blink 7-color": 149,
-}
+def ripple_envelope(t):
+    """t in 0..1 -> brightness level 0..1 for the 'connected' ripple.
+    Snaps up to full, then dips through several decaying bounces and settles at ~1.0.
+    Using dips (subtractive) instead of an overshooting cosine keeps every bounce
+    visible instead of clipping the peaks flat at 1.0."""
+    rise = min(1.0, t / 0.10)                                  # quick jump to full
+    dips = math.exp(-2.4 * t) * abs(math.sin(2 * math.pi * 2.0 * t))  # 4 decaying bounces
+    return max(0.0, min(1.0, rise * (1.0 - 0.9 * dips)))
+
 
 PRESETS = [
     ("Red", (255, 0, 0)), ("Green", (0, 255, 0)), ("Blue", (0, 0, 255)),
@@ -95,14 +93,370 @@ SYNC_STYLES = {
 SYNC_BLACK_LUMA = 16      # below this luminance a scene counts as "dark"
 SYNC_GLOW_SCALE = 0.10    # dark scenes fade to 10% of the last bright color (dim glow)
 
+AUDIO_MODES = {
+    # name -> one-line description shown under the picker
+    "Pulse":       "Bass drives the brightness of your color",
+    "Beat flash":  "Your color flashes on every beat, then fades",
+    "Beat colors": "Jumps to a new color on every beat",
+    "Spectrum":    "Bass = red, mids = green, highs = blue",
+    "Pitch":       "Low sounds glow red, high sounds glow blue",
+}
+SYSTEM_AUDIO = "System audio (what's playing)"
+
+
+# ---- software flame effects: brightness-only flicker on the current color ----
+# name -> (floor, flicker, gusts_per_sec)
+#   floor   = lowest brightness as a fraction of the slider (never goes dark)
+#   flicker = share of the swing from fast jitter (rest is slow "breathing" drift)
+#   gusts   = how often a draft makes the flame dip suddenly
+FLAME_EFFECTS = {
+    "Candle": (0.70, 0.25, 0.08),
+    "Torch":  (0.45, 0.40, 0.25),
+    "Fire":   (0.25, 0.55, 0.60),
+}
+
+
+class Flame:
+    """Smooth random brightness 0..1 for a flame. Three layers: slow drift toward
+    random targets, fast eased jitter, and occasional gusts that dip quickly and
+    recover slowly. Pure (no I/O) so it's testable."""
+    def __init__(self, floor, flicker, gusts, rng=None):
+        import random
+        self.floor, self.flicker, self.gusts = floor, flicker, gusts
+        self.rng = rng or random.Random()
+        self.slow = self.slow_target = 0.8
+        self.fast = self.fast_target = 0.5
+        self.gust = self.gust_target = 0.0
+
+    def step(self, dt, speed=50):
+        """Advance dt seconds; speed 1..100 (50 = natural). Returns level in [floor, 1]."""
+        r, sf = self.rng, 0.4 + speed / 50.0          # speed factor ~0.42..2.4
+        if r.random() < dt * 0.7 * sf:                # new breathing target now and then
+            self.slow_target = r.uniform(0.55, 1.0)
+        self.slow += (self.slow_target - self.slow) * min(1.0, dt * 1.5 * sf)
+        if r.random() < min(1.0, dt * 6.0 * sf):      # new jitter target most ticks
+            self.fast_target = r.random()
+        self.fast += (self.fast_target - self.fast) * min(1.0, dt * 6.0 * sf)
+        if r.random() < dt * self.gusts * sf:         # a draft hits the flame
+            self.gust_target = r.uniform(0.4, 0.8)
+        self.gust_target *= math.exp(-dt * 2.5 * sf)  # draft fades -> slow recovery
+        self.gust += (self.gust_target - self.gust) * min(1.0, dt * 4.0 * sf)
+        v = self.slow * (1 - self.flicker) + self.fast * self.flicker - self.gust * 0.6
+        v = max(0.0, min(1.0, v))
+        return self.floor + (1.0 - self.floor) * v
+
+
+# ---- more software effects. step(dt, speed) returns EITHER a float level 0..1
+# (brightness of the user's color) OR an (r, g, b) tuple at full brightness (the
+# effect picks the color). The brightness slider scales both. speed 50 = natural.
+def _sf(speed):
+    """Speed slider 1..100 -> rate factor 0.31..1.7, exactly 1.0 at 50 (natural pace)."""
+    return 0.3 + 0.7 * speed / 50.0
+
+
+class Breathe:
+    """Slow sine swell between a dim floor and full, on the current color."""
+    def __init__(self):
+        self.t = 0.0
+
+    def step(self, dt, speed=50):
+        self.t += dt * _sf(speed)
+        return 0.10 + 0.90 * (0.5 - 0.5 * math.cos(2 * math.pi * self.t / 6.0))  # 6 s
+
+
+class Heartbeat:
+    """Lub-dub double pulse then a rest, ~60 bpm at speed 50, on the current color."""
+    def __init__(self):
+        self.t = 0.0
+
+    def step(self, dt, speed=50):
+        self.t = (self.t + dt * _sf(speed)) % 1.0     # one beat = 1.0 s at sf 1
+        # each pulse is a 0.22 s sine bump: wider than ~2 send ticks (80 ms), so the
+        # strip can't miss a beat between updates. lub at 0, dub at 0.32.
+        bump = lambda x: math.sin(math.pi * x / 0.22) if 0 <= x < 0.22 else 0.0
+        return 0.20 + 0.80 * max(bump(self.t), 0.75 * bump(self.t - 0.32))
+
+
+class Lightning:
+    """Dim night-blue sky with random white double/triple flashes (picks its colors)."""
+    PICKS_COLOR = True                            # ignores the user's color
+    # LEDs look far brighter than their value at the low end, so the sky must be
+    # tiny next to the bolt (was 20,35,110: too bright, flashes barely stood out)
+    SKY, BOLT = (2, 4, 16), (255, 255, 255)
+
+    def __init__(self, rng=None):
+        import random
+        self.rng = rng or random.Random()
+        self.seq = []                                 # flash levels still to play, 1/tick
+
+    def step(self, dt, speed=50):
+        r = self.rng
+        if not self.seq and r.random() < dt * 0.35 * _sf(speed):   # a strike begins
+            self.seq = []
+            for _ in range(r.randint(1, 3)):
+                self.seq += [r.uniform(0.7, 1.0), r.uniform(0.0, 0.3)]
+            self.seq += [0.15, 0.05]                  # afterglow
+        lvl = self.seq.pop(0) if self.seq else 0.0
+        return tuple(int(s + (b - s) * lvl) for s, b in zip(self.SKY, self.BOLT))
+
+
+class Rainbow:
+    """Slow trip around the color wheel, ~30 s per lap at speed 50 (picks its colors)."""
+    PICKS_COLOR = True                            # ignores the user's color
+    def __init__(self):
+        self.h = 0.0
+
+    def step(self, dt, speed=50):
+        self.h = (self.h + dt * _sf(speed) / 30.0) % 1.0
+        return hs_rgb(self.h, 1.0)
+
+
+class Ocean:
+    """Calm drift through blues and teals with gentle swells (picks its colors)."""
+    PICKS_COLOR = True                            # ignores the user's color
+    def __init__(self, rng=None):
+        import random
+        self.rng = rng or random.Random()
+        self.h = self.h_target = 0.55
+        self.v = self.v_target = 0.8
+
+    def step(self, dt, speed=50):
+        r, sf = self.rng, _sf(speed)
+        if r.random() < dt * 0.4 * sf:
+            self.h_target = r.uniform(0.47, 0.64)     # teal .. deep blue
+        if r.random() < dt * 0.6 * sf:
+            self.v_target = r.uniform(0.55, 1.0)
+        self.h += (self.h_target - self.h) * min(1.0, dt * 0.6 * sf)
+        self.v += (self.v_target - self.v) * min(1.0, dt * 1.0 * sf)
+        return tuple(int(c * self.v) for c in hs_rgb(self.h, 0.9))
+
+
+class Police:
+    """Red double-blink, then blue double-blink (picks its colors)."""
+    PICKS_COLOR = True                            # ignores the user's color
+    PATTERN = [(255, 0, 0), (0, 0, 0), (255, 0, 0), (0, 0, 0),
+               (0, 0, 255), (0, 0, 0), (0, 0, 255), (0, 0, 0)]
+
+    def __init__(self):
+        self.t = 0.0
+
+    def step(self, dt, speed=50):
+        # one pattern step lasts >= 2 ticks at speed 50, so no blink falls between sends
+        self.t += dt * _sf(speed)
+        return self.PATTERN[int(self.t / 0.16) % len(self.PATTERN)]
+
+
+# name -> factory for every app-driven effect (they stop when RGBZap quits; the
+# controller's built-in EFFECTS keep running without the PC)
+SOFT_EFFECTS = {
+    **{name: (lambda p=p: Flame(*p)) for name, p in FLAME_EFFECTS.items()},
+    "Breathe": Breathe, "Heartbeat": Heartbeat, "Lightning": Lightning,
+    "Rainbow": Rainbow, "Ocean": Ocean, "Police": Police,
+}
+
+# ---- notification / call alerts ----
+# ponytail: wording heuristic, English only; add per-app rules if a caller app is missed
+_CALL_RE = re.compile(r"incoming (voice |video |audio )?call|is calling|calling you|"
+                      r"call from|ringing", re.I)
+CALL_MAX_S = 30.0                       # stop pulsing even if the call toast lingers
+
+
+def is_call(text):
+    """True if a notification's app name + text reads like an incoming call."""
+    return bool(_CALL_RE.search(text or ""))
+
+
+def alert_frame(kind, t):
+    """(r, g, b) for an alert at t seconds, or None when it's over.
+    notify: two quick white pulses (1 s). call: green swell until cancelled."""
+    if kind == "notify":
+        if t >= 1.0:
+            return None
+        lvl = math.sin(math.pi * (t % 0.5) / 0.5) ** 2
+        return (int(255 * lvl),) * 3
+    lvl = 0.15 + 0.85 * (0.5 - 0.5 * math.cos(2 * math.pi * t / 1.2))
+    return (0, int(255 * lvl), int(60 * lvl))
+
+
+_HW_COLORS = {"Red": (255, 0, 0), "Green": (0, 255, 0), "Blue": (0, 0, 255),
+              "Yellow": (255, 255, 0), "Cyan": (0, 255, 255), "Magenta": (255, 0, 255),
+              "White": (255, 255, 255)}
+
+
+def builtin_preview(name, t):
+    """(r, g, b) a controller built-in effect shows at time t (seconds at speed 50).
+    Drives the EFFECTS tab tiles: what the effect does, not the strip's exact timing.
+    ponytail: hand-tuned periods; the controller's real ones vary by firmware."""
+    kind, _, what = name.partition(" ")
+    if what == "7-color":
+        cols = list(_HW_COLORS.values())
+    elif what == "RGB":
+        cols = [_HW_COLORS[c] for c in ("Red", "Green", "Blue")]
+    else:
+        cols = [_HW_COLORS[c] for c in what.split("-")]
+    n = len(cols)
+    if kind == "Jump":
+        return cols[int(t / 0.7) % n]
+    if kind == "Blink":
+        i = int(t / 0.35)
+        return cols[(i // 2) % n] if i % 2 == 0 else (0, 0, 0)
+    if n == 1:                                   # Crossfade one color: swell in and out
+        lvl = 0.5 - 0.5 * math.cos(2 * math.pi * t / 2.4)
+        return tuple(int(c * lvl) for c in cols[0])
+    pos = (t / 1.6) % n                          # Crossfade several: blend into the next
+    i, f = int(pos), pos - int(pos)
+    f = f * f * (3 - 2 * f)
+    a, b = cols[i], cols[(i + 1) % n]
+    return tuple(int(x + (y - x) * f) for x, y in zip(a, b))
+
+
+# ---- persisted settings (restored on next launch) ----
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "elk_settings.json")
+DEFAULT_SETTINGS = {
+    "color": [255, 255, 255], "brightness": 100, "mode": "color",
+    "effect": list(EFFECTS)[0], "speed": 50,
+    "display": "", "style": "Balanced", "extract": "Dominant", "dark": "Dim",
+    "sat": int(SYNC_STYLES["Balanced"][0] * 100), "smooth": 30,
+    "custom": [],                       # saved picker colors, newest first
+    "strips": [],                       # user's light strips: [[name, address], ...]
+    "notify_flash": False, "notify_call": False,   # alert on notifications / calls
+    "audio_mode": "Pulse", "audio_source": SYSTEM_AUDIO,
+    "audio_sens": 50, "audio_smooth": 40, "audio_floor": 8,
+    # named snapshots of the LIGHT tab; starters until the user changes the list
+    "scenes": {
+        "Focus":       {"color": [180, 220, 255], "brightness": 100, "mode": "color",
+                        "effect": "Candle", "speed": 50},
+        "Movie night": {"color": [255, 138, 18], "brightness": 20, "mode": "color",
+                        "effect": "Candle", "speed": 50},
+        "Cozy fire":   {"color": [255, 90, 0], "brightness": 70, "mode": "effect",
+                        "effect": "Candle", "speed": 40},
+        "Relax":       {"color": [150, 0, 255], "brightness": 60, "mode": "effect",
+                        "effect": "Breathe", "speed": 30},
+        "Party":       {"color": [255, 255, 255], "brightness": 100, "mode": "effect",
+                        "effect": "Rainbow", "speed": 90},
+        "Storm":       {"color": [255, 255, 255], "brightness": 90, "mode": "effect",
+                        "effect": "Lightning", "speed": 50},
+        "Night light": {"color": [255, 60, 10], "brightness": 6, "mode": "color",
+                        "effect": "Candle", "speed": 50},
+    },
+}
+SCENE_FIELDS = ("color", "brightness", "mode", "effect", "speed")
+CUSTOM_MAX = 9                          # one chip row, same width as the presets
+
+
+def _is_rgb(c):
+    return (type(c) is list and len(c) == 3
+            and all(type(x) is int and 0 <= x <= 255 for x in c))
+
+
+# ---- live color picker: hue across, saturation down, full value ----
+# (brightness has its own slider, so the picker only needs hue + saturation)
+def hs_rgb(h, s):
+    """Hue 0..1, saturation 0..1 at full value -> (r, g, b) ints."""
+    return tuple(int(round(c * 255)) for c in colorsys.hsv_to_rgb(h % 1.0, s, 1.0))
+
+
+def hs_image_data(w, h):
+    """PhotoImage.put() data for a w x h hue/saturation field. Pixel (x, y) is
+    hs_rgb(x/(w-1), 1 - y/(h-1)), so a click maps back to exactly what's shown."""
+    hue = np.linspace(0.0, 1.0, w)[None, :].repeat(h, 0) % 1.0
+    sat = np.linspace(1.0, 0.0, h)[:, None].repeat(w, 1)
+    i = np.floor(hue * 6.0).astype(int) % 6
+    f = hue * 6.0 - np.floor(hue * 6.0)
+    one, p, q, t = np.ones_like(sat), 1 - sat, 1 - sat * f, 1 - sat * (1 - f)
+    r = np.choose(i, [one, q, p, p, t, one])
+    g = np.choose(i, [t, one, one, q, p, p])
+    b = np.choose(i, [p, p, t, one, one, q])
+    rgb = np.rint(np.stack([r, g, b], -1) * 255).astype(int)
+    return " ".join("{" + " ".join("#%02x%02x%02x" % tuple(px) for px in row) + "}"
+                    for row in rgb)
+
+
+_SETTING_CHOICES = {
+    "mode": ("color", "effect"), "effect": {**SOFT_EFFECTS, **EFFECTS},
+    "style": SYNC_STYLES,
+    "extract": ("Dominant", "Average"), "dark": ("Dim", "Glow", "Keep"),
+    "audio_mode": AUDIO_MODES,
+}
+_SETTING_RANGES = {"brightness": (1, 100), "speed": (1, 100), "sat": (100, 250),
+                   "smooth": (5, 100), "audio_sens": (1, 100), "audio_smooth": (0, 100),
+                   "audio_floor": (0, 50)}
+
+
+def load_settings(path=SETTINGS_FILE):
+    """Saved settings merged over defaults. Any missing, mistyped or out-of-range
+    value falls back to its default, so a hand-edited/corrupt file can't crash launch."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        raw = {}
+    cfg = dict(DEFAULT_SETTINGS)
+    if not isinstance(raw, dict):
+        return cfg
+    for k in DEFAULT_SETTINGS:
+        v = raw.get(k)
+        if k == "custom" and type(v) is list:
+            cfg[k] = [c for c in v if _is_rgb(c)][:CUSTOM_MAX]   # drop bad entries only
+        elif k == "strips" and type(v) is list:
+            cfg[k] = [s for s in v if type(s) is list and len(s) == 2
+                      and all(type(x) is str and x for x in s)]
+        elif k == "scenes" and type(v) is dict:
+            cfg[k] = {name: {f: sc[f] for f in SCENE_FIELDS} for name, sc in v.items()
+                      if type(name) is str and 0 < len(name) <= 40 and type(sc) is dict
+                      and all(_valid_setting(f, sc.get(f)) for f in SCENE_FIELDS)}
+        elif k not in ("custom", "strips", "scenes") and _valid_setting(k, v):
+            cfg[k] = v
+    return cfg
+
+
+def _valid_setting(k, v):
+    """True if v is an acceptable value for scalar setting k (type, choices, range)."""
+    if type(v) is not type(DEFAULT_SETTINGS[k]):
+        return False
+    if k == "color" and not _is_rgb(v):
+        return False
+    if k in _SETTING_CHOICES and v not in _SETTING_CHOICES[k]:
+        return False
+    lo_hi = _SETTING_RANGES.get(k)
+    return lo_hi is None or lo_hi[0] <= v <= lo_hi[1]
+
+
+def save_settings(cfg, path=SETTINGS_FILE):
+    """Write atomically (temp file + replace) so a crash mid-write can't corrupt it."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+    os.replace(tmp, path)
+
+
+
+# ---- UI theme: dark "light console" (accent is the strip's live color) ----
+INK, PANEL, PANEL2 = "#0A0C12", "#12151E", "#1A1F2B"
+LINE, TEXT, MUTE = "#262D3A", "#E8ECF4", "#8592A6"
+GOOD, BAD = "#37D39A", "#FF5D5D"
+SYNC_BLUE = "#3B82F6"
+AUDIO_PINK = "#E0479E"
+FONT_H1   = ("Bahnschrift SemiBold", 18)
+FONT_EYE  = ("Bahnschrift SemiBold", 9)
+FONT_TAB  = ("Bahnschrift SemiBold", 10)
+FONT_BODY = ("Segoe UI", 10)
+FONT_BTN  = ("Segoe UI Semibold", 10)
+FONT_MONO = ("Consolas", 10)
+FONT_HEX  = ("Consolas", 15)
+
 
 # --- "run at Windows startup" via the HKCU Run registry key ---
 _RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-_APP_NAME = "ElkBledomController"
+_APPROVED_KEY = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
+_APP_NAME = "RGBZap"
+_OLD_APP_NAME = "ElkBledomController"     # name used before the RGBZap rename
 
 
 def _startup_command():
     """Command that launches this GUI with NO console window (pythonw.exe)."""
+    if getattr(sys, "frozen", False):     # built RGBZap.exe: just the exe itself
+        return f'"{sys.executable}"'
     pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
     if not os.path.exists(pyw):
         pyw = sys.executable
@@ -115,9 +469,18 @@ def startup_enabled():
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as k:
             val, _ = winreg.QueryValueEx(k, _APP_NAME)
-            return bool(val)
+            if not val:
+                return False
     except OSError:
         return False
+    # Task Manager / Settings "Startup apps" can disable the entry without
+    # removing it: odd first byte in StartupApproved = disabled.
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _APPROVED_KEY) as k:
+            flag, _ = winreg.QueryValueEx(k, _APP_NAME)
+            return not (flag and flag[0] & 1)
+    except OSError:
+        return True
 
 
 def set_startup(enable):
@@ -129,14 +492,41 @@ def set_startup(enable):
                             winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE) as k:
             if enable:
                 winreg.SetValueEx(k, _APP_NAME, 0, winreg.REG_SZ, _startup_command())
+                # clear a Task Manager "Disabled" flag, else Windows skips the entry
+                try:
+                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _APPROVED_KEY, 0,
+                                        winreg.KEY_SET_VALUE) as a:
+                        winreg.DeleteValue(a, _APP_NAME)
+                except OSError:
+                    pass
             else:
                 try:
                     winreg.DeleteValue(k, _APP_NAME)
                 except FileNotFoundError:
                     pass
+            try:                             # drop the pre-rename entry either way
+                winreg.DeleteValue(k, _OLD_APP_NAME)
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _APPROVED_KEY, 0,
+                                    winreg.KEY_SET_VALUE) as a:
+                    winreg.DeleteValue(a, _OLD_APP_NAME)
+            except OSError:
+                pass
         return True
     except OSError:
         return False
+
+
+def migrate_startup():
+    """Builds before the RGBZap rename registered under another name: if that
+    entry exists, re-register under the new name (set_startup drops the old one)."""
+    if winreg is None:
+        return
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as k:
+            winreg.QueryValueEx(k, _OLD_APP_NAME)
+    except OSError:
+        return
+    set_startup(True)
 
 
 def acquire_single_instance_lock():
@@ -165,9 +555,23 @@ class BleWorker:
         self.loop = asyncio.new_event_loop()
         self.client: BleakClient | None = None
         self.address: str | None = None
+        self.write_uuid: str | None = None   # resolved per device after connect
+        self.fx_provider = None              # App-set: () -> (color, brightness) | None
         # coalescing writer state (all touched only inside the loop thread)
         self._pending: dict[str, bytes] = {}
         self._evt: asyncio.Event | None = None
+        # One connect at a time. Without this, writes queued at launch (sliders fire
+        # their callbacks when initialised) each started their own connect, leaving
+        # several clients on the strip; when a stray one dropped, the link the app
+        # wrote through went dead while the UI still showed "Connected".
+        self._conn_lock = asyncio.Lock()
+        self._want_connected = False         # True until the user disconnects/closes
+        # alerts (notifications/calls): play over whatever runs, then restore it
+        self._last: dict[bytes, bytes] = {}  # frame kind -> latest sent, in send order
+        self._held: dict[str, bytes] = {}    # channel frames queued while an alert plays
+        self._alert_on = False
+        self._alert_lock = asyncio.Lock()
+        self.alert_cancel = False            # set from any thread: stop the current alert
         t = threading.Thread(target=self._run_loop, daemon=True)
         t.start()
 
@@ -179,6 +583,26 @@ class BleWorker:
     def _start_writer(self):
         self._evt = asyncio.Event()
         self.loop.create_task(self._writer())
+        self.loop.create_task(self._watchdog())
+
+    def _connected(self):
+        return bool(self.client and self.client.is_connected and self.write_uuid)
+
+    async def _watchdog(self):
+        """Keep the link up: if it should be connected but isn't (strip dropped,
+        out of range, power blip), reconnect on its own, backing off 3s -> 30s."""
+        delay = 3.0
+        while True:
+            await asyncio.sleep(delay)
+            if not self._want_connected or self._connected():
+                delay = 3.0
+                continue
+            self.status_cb("Link lost — reconnecting...")
+            try:
+                await self._connect()
+            except Exception as e:
+                self.status_cb(f"Reconnect failed: {e}")
+            delay = 3.0 if self._connected() else min(30.0, delay * 2)
 
     async def _writer(self):
         """Single writer: coalesces rapid updates so only the latest value per
@@ -196,7 +620,13 @@ class BleWorker:
             items = list(self._pending.items())
             self._pending.clear()
             for _channel, payload in items:
-                await self._write(payload)
+                # A transient BLE error (e.g. a scan/reconnect raising mid-write)
+                # must NOT kill this loop — that would silently freeze the color
+                # channel forever while direct send() writes keep working.
+                try:
+                    await self._write(payload)
+                except Exception as e:
+                    self.status_cb(f"Write dropped: {e}")
             await asyncio.sleep(SEND_INTERVAL)  # pace to real drain rate
 
     def submit(self, coro):
@@ -208,6 +638,9 @@ class BleWorker:
         self.loop.call_soon_threadsafe(self._set_pending, channel, payload)
 
     def _set_pending(self, channel, payload):
+        if self._alert_on:                   # hold it: sent once the alert finishes
+            self._held[channel] = payload
+            return
         self._pending[channel] = payload
         if self._evt is not None:
             self._evt.set()
@@ -219,8 +652,7 @@ class BleWorker:
     async def _scan_once(self, timeout=8.0):
         devices = await BleakScanner.discover(timeout=timeout)
         for d in devices:
-            name = (d.name or "").lower()
-            if any(name.startswith(p) for p in NAME_PREFIXES):
+            if is_strip_name(d.name):
                 return d.address
         return None
 
@@ -241,59 +673,220 @@ class BleWorker:
         self.status_cb("No strip found — is it on and the phone app closed?")
         return None
 
-    async def _connect(self):
-        if self.client and self.client.is_connected:
+    async def _scan_all(self, timeout=8.0):
+        """Every strip in range as [(name, address)]. Read-only: doesn't touch the
+        current link (a connected strip stops advertising, so it won't be listed)."""
+        devices = await BleakScanner.discover(timeout=timeout)
+        return [(d.name, d.address) for d in devices if is_strip_name(d.name)]
+
+    async def _select(self, addr):
+        """Switch to a user-picked strip: remember it, release any other strip,
+        then connect through the normal path (lock, fallbacks, watchdog)."""
+        self._want_connected = True
+        if addr == self.address and self._connected():
             self.status_cb("Already connected")
-            self._set_connected(True)
             return
+        async with self._conn_lock:
+            self.address = addr
+            try:
+                with open(ADDR_FILE, "w") as f:
+                    f.write(addr)
+            except OSError:
+                pass
+            await self._drop_client()
+            self._set_connected(False)
+        await self._connect(fx=True)
+
+    async def _alert(self, kind, brightness, max_s=CALL_MAX_S):
+        """Play a notification ("notify") or call ("call") alert over whatever is
+        running, then put the strip back as it was: replay the latest frame of each
+        kind in send order (so off stays off, an effect resumes), then any frames
+        that sync/audio/effects queued meanwhile."""
+        if kind == "notify" and self._alert_on:
+            return                           # something is already flashing
+        if not self._connected():
+            return                           # never start a connect just to flash
+        async with self._alert_lock:         # a call waits for a notify to finish
+            self._alert_on, self.alert_cancel = True, False
+            s = max(brightness, 50) / 100.0  # visible even at a dim brightness
+            try:
+                await self._write(cmd_on(), track=False)
+                t = 0.0
+                while not self.alert_cancel and t < max_s:
+                    rgb = alert_frame(kind, t)
+                    if rgb is None:
+                        break
+                    await self._write(cmd_color(*(int(c * s) for c in rgb)), track=False)
+                    await asyncio.sleep(SEND_INTERVAL)
+                    t += SEND_INTERVAL
+            finally:
+                for payload in list(self._last.values()):
+                    await self._write(payload, track=False)
+                self._alert_on = False
+                held, self._held = self._held, {}
+                for channel, payload in held.items():
+                    self._set_pending(channel, payload)
+
+    async def _open(self, target):
+        """Connect to a BLEDevice or a raw address string. Returns True on success.
+        Connecting by raw address recovers the common 'strip left in a ghost
+        connection so it isn't advertising' case — Windows can still reach a device
+        it has seen before without a fresh advertisement."""
+        if not target:
+            return False
+        self.status_cb(f"Connecting to {self.address}...")
+        await self._drop_client()            # never leave a stale client holding the strip
+        client = None
+        try:
+            client = BleakClient(target, timeout=20.0,
+                                 disconnected_callback=self._on_disconnect)
+            await client.connect()
+            wu = await pick_write_char(client)
+            if wu is None:
+                # Distinguish a half-open connection (GATT not enumerated — happens
+                # when reconnecting to a still-settling strip) from a genuinely
+                # unsupported model. Only the latter has real characteristics but
+                # none writable; the former just needs a retry.
+                n_chars = sum(1 for s in client.services for _ in s.characteristics)
+                await client.disconnect()
+                self._set_connected(False)
+                if n_chars > 0:
+                    self._unsupported = True   # real GATT, nothing writable
+                return False
+            self.client = client
+            self.write_uuid = wu
+            self.status_cb(f"Connected  ({self.address})")
+            self._set_connected(True)
+            return True
+        except Exception as e:
+            if client is not None:           # half-open attempt: release it
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+            self.status_cb(f"Connect failed: {e}")
+            self._set_connected(False)
+            return False
+
+    async def _drop_client(self):
+        """Disconnect and forget the current client (if any), ignoring errors."""
+        old, self.client, self.write_uuid = self.client, None, None
+        if old is not None:
+            try:
+                await old.disconnect()
+            except Exception:
+                pass
+
+    async def _play_connect_fx(self, color, brightness):
+        """Damped brightness ripple on `color`, settling to color*brightness."""
+        r, g, b = color
+        await self._write(cmd_on())
+        n = 20   # more frames so the multiple bounces render smoothly
+        for i in range(n):
+            lvl = ripple_envelope(i / (n - 1))
+            await self._write(cmd_color(int(r * lvl), int(g * lvl), int(b * lvl)))
+            await asyncio.sleep(SEND_INTERVAL)
+        s = brightness / 100.0
+        await self._write(cmd_color(int(r * s), int(g * s), int(b * s)))
+
+    async def _connect(self, fx=False):
+        self._want_connected = True
+        async with self._conn_lock:
+            if self._connected():
+                if fx:                       # only report it for a user-pressed Connect
+                    self.status_cb("Already connected")
+                self._set_connected(True)
+                return
+            fresh = await self._connect_locked()
+        # ripple runs outside the lock: its writes may need to reconnect, and the
+        # lock isn't re-entrant. Only on a user/launch connect (fx=True) and only
+        # when nothing else owns the color channel (provider returns None).
+        if fresh and fx and self.fx_provider:
+            params = self.fx_provider()
+            if params:
+                await self._play_connect_fx(*params)
+
+    async def _connect_locked(self):
+        """Try every connect strategy. Returns True once connected."""
+        from_cache = False
+        self._unsupported = False   # set True only if we see real GATT with no writable char
         if not self.address:
             if os.path.exists(ADDR_FILE):
                 self.address = open(ADDR_FILE).read().strip()
+                from_cache = bool(self.address)
             if not self.address:
                 await self._scan()
             if not self.address:
-                return
-        # On Windows, connecting by raw address only works if the device was
-        # freshly discovered — resolve a BLEDevice via a scan first.
-        self.status_cb(f"Locating {self.address}...")
-        device = await BleakScanner.find_device_by_address(self.address, timeout=12.0)
-        if device is None:
-            self.status_cb("Strip not advertising — is it on and the phone app closed?")
-            self._set_connected(False)
-            return
-        self.status_cb(f"Connecting to {self.address}...")
-        try:
-            self.client = BleakClient(device, timeout=20.0,
-                                      disconnected_callback=self._on_disconnect)
-            await self.client.connect()
-            self.status_cb(f"Connected  ({self.address})")
-            self._set_connected(True)
-        except Exception as e:
-            self.client = None
-            self.status_cb(f"Connect failed: {e}")
-            self._set_connected(False)
+                return False
 
-    def _on_disconnect(self, _client):
-        # called by bleak from its own thread/loop
+        # 1) fast path: connect straight to the known address, no scan. Windows
+        #    can reach a device it has seen before without a fresh advertisement,
+        #    and the strip stops advertising while connected anyway, so scanning
+        #    first just wastes ~12s and can miss it.
+        self.status_cb(f"Connecting to {self.address}...")
+        if await self._open(self.address):
+            return True
+
+        # 2) raw connect failed — the link may be stale. Settle, then scan for a
+        #    fresh advertisement and use that BLEDevice (falls back to raw again).
+        await asyncio.sleep(1.5)
+        device = await BleakScanner.find_device_by_address(self.address, timeout=8.0)
+        if await self._open(device or self.address):
+            return True
+
+        # 3) a cached/shared address may just be wrong for this machine — forget it
+        #    and scan fresh for whatever strip is actually here.
+        if from_cache:
+            self._forget_address()
+            addr = await self._scan()
+            if addr and await self._open(addr):
+                return True
+
+        if self._unsupported:
+            self.status_cb("Connected, but this strip model isn't supported yet "
+                           "(no writable characteristic).")
+        else:
+            self.status_cb("Couldn't connect — power-cycle the strip and close the phone app.")
         self._set_connected(False)
-        self.status_cb("Device disconnected")
+        return False
+
+    def _forget_address(self):
+        self.address = None
+        try:
+            os.remove(ADDR_FILE)
+        except OSError:
+            pass
+
+    def _on_disconnect(self, client):
+        # called by bleak; ignore stale/probe clients so they can't flip the UI
+        if client is not self.client:
+            return
+        self._set_connected(False)
+        self.status_cb("Device disconnected" if not self._want_connected
+                       else "Link lost — reconnecting...")  # watchdog takes it from here
 
     async def _disconnect(self):
-        if self.client and self.client.is_connected:
-            await self.client.disconnect()
-        self.client = None
+        self._want_connected = False         # user asked: stop the watchdog reconnecting
+        async with self._conn_lock:
+            await self._drop_client()
         self._set_connected(False)
         self.status_cb("Disconnected")
 
-    async def _write(self, payload):
-        if not self.client or not self.client.is_connected:
+    async def _write(self, payload, track=True):
+        if not self._connected():
+            if not self._want_connected:
+                return                       # user disconnected: don't silently reconnect
             await self._connect()
-        if self.client and self.client.is_connected:
+        if self._connected():
             try:
-                await self.client.write_gatt_char(WRITE_UUID, payload, response=False)
+                await self.client.write_gatt_char(self.write_uuid, payload, response=False)
+                if track:                    # remember the strip's state for alert restore
+                    kind = payload[2:3]      # frame type: power / color / effect / speed
+                    self._last.pop(kind, None)
+                    self._last[kind] = payload
             except Exception as e:
-                self.status_cb(f"Write failed: {e}")
-                self.client = None
+                self.status_cb(f"Write failed: {e} — reconnecting...")
+                await self._drop_client()    # release it so the strip is free to reconnect
                 self._set_connected(False)
 
 
@@ -307,6 +900,9 @@ class ScreenSync:
         self.get_brightness = get_brightness
         self.monitor_index = 1              # which mss monitor (1..n); set from GUI
         self.style = "Balanced"
+        self.extract_mode = "Dominant"      # "Dominant" (vivid) | "Average"
+        self.dark_mode = "Dim"              # "Dim" | "Glow" | "Keep"
+        self.sat = SYNC_STYLES["Balanced"][0]  # live saturation factor (Style sets it)
         self.alpha = 0.30                   # smoothing: higher = snappier
         # Capture a bit above the BLE send rate (~12.5/s) so each send uses a
         # fresh frame; the writer coalesces and drops any extras. No point
@@ -345,8 +941,10 @@ class ScreenSync:
         return self._running
 
     def _extract(self, arr):
-        """arr = HxWx4 BGRA uint8. Returns (r,g,b) ints after style + dark-glow."""
-        sat, gamma, center = SYNC_STYLES.get(self.style, SYNC_STYLES["Balanced"])
+        """arr = HxWx4 BGRA uint8. Returns (r, g, b, level): color plus a 0..1
+        brightness multiplier the caller applies (used by the 'Dim' dark mode)."""
+        _sat0, gamma, center = SYNC_STYLES.get(self.style, SYNC_STYLES["Balanced"])
+        sat = self.sat                      # live-tunable, overrides the style's sat
         h, w = arr.shape[:2]
         if center:
             # sample the central 60% for a punchier dominant color
@@ -355,9 +953,23 @@ class ScreenSync:
             region = arr[y0:y1, x0:x1]
         else:
             region = arr
-        # subsample for speed, take BGR channels, average
+        # subsample for speed; BGR float
         sub = region[::8, ::8, :3].astype(np.float32)
-        b, g, r = sub[..., 0].mean(), sub[..., 1].mean(), sub[..., 2].mean()
+        b_ch, g_ch, r_ch = sub[..., 0], sub[..., 1], sub[..., 2]
+
+        if self.extract_mode == "Dominant":
+            # saturation-weighted mean: colorful pixels dominate, grays are ignored,
+            # so the scene's subject color pops instead of averaging to mud.
+            mx = np.maximum(np.maximum(r_ch, g_ch), b_ch)
+            mn = np.minimum(np.minimum(r_ch, g_ch), b_ch)
+            s = (mx - mn) / (mx + 1e-3)     # per-pixel saturation 0..1
+            wgt = s * s + 0.05              # +floor so an all-gray frame still resolves
+            wsum = wgt.sum()
+            r = (r_ch * wgt).sum() / wsum
+            g = (g_ch * wgt).sum() / wsum
+            b = (b_ch * wgt).sum() / wsum
+        else:                               # "Average" — flat mean
+            r, g, b = r_ch.mean(), g_ch.mean(), b_ch.mean()
         rgb = np.array([r, g, b])
 
         # gamma (brighten mids for Vivid)
@@ -366,16 +978,26 @@ class ScreenSync:
 
         # saturation boost in HSV
         if sat != 1.0:
-            hh, ss, vv = colorsys.rgb_to_hsv(*(rgb / 255.0))
+            hh, ss, vv = colorsys.rgb_to_hsv(*(np.clip(rgb, 0, 255) / 255.0))
             ss = min(1.0, ss * sat)
             rgb = np.array(colorsys.hsv_to_rgb(hh, ss, vv)) * 255.0
 
-        # dark-scene / DRM-black handling -> dim glow of the last bright color
         luma = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
-        if luma < SYNC_BLACK_LUMA:
-            rgb = self._last_bright * SYNC_GLOW_SCALE
-        else:
+        level = 1.0
+        if self.dark_mode == "Dim":
+            # dark scene -> dim the strip but keep the real hue. Normalize color up
+            # to a visible value so the hue shows, then pull brightness via level.
+            level = float(np.clip(luma / 48.0, 0.0, 1.0))
+            if luma > 1.0:
+                rgb = rgb * (min(200.0, luma * 4.0) / luma)  # lift hue to visible
             self._last_bright = rgb.copy()
+        elif self.dark_mode == "Glow":
+            # dark / DRM-black -> dim glow of the last bright color
+            if luma < SYNC_BLACK_LUMA:
+                rgb = self._last_bright * SYNC_GLOW_SCALE
+            else:
+                self._last_bright = rgb.copy()
+        # "Keep" -> raw color, level stays 1.0
 
         # temporal smoothing (anti-strobe)
         if self._prev is None:
@@ -383,7 +1005,7 @@ class ScreenSync:
         else:
             self._prev = self._prev * (1 - self.alpha) + rgb * self.alpha
         out = np.clip(self._prev, 0, 255).astype(int)
-        return int(out[0]), int(out[1]), int(out[2])
+        return int(out[0]), int(out[1]), int(out[2]), level
 
     def _run(self):
         import mss
@@ -401,8 +1023,8 @@ class ScreenSync:
                     shot = sct.grab(mon)
                     arr = np.frombuffer(shot.raw, dtype=np.uint8).reshape(
                         shot.height, shot.width, 4)
-                    r, g, b = self._extract(arr)
-                    scale = self.get_brightness() / 100.0
+                    r, g, b, level = self._extract(arr)
+                    scale = (self.get_brightness() / 100.0) * level
                     self.ble.queue("color", cmd_color(int(r * scale),
                                                       int(g * scale), int(b * scale)))
                     self.color_cb((r, g, b))
@@ -416,147 +1038,738 @@ class ScreenSync:
             self.status_cb("Screen Sync OFF")
 
 
+class AudioAnalyzer:
+    """Pure DSP: feed mono sample blocks, get normalised bass/mid/high/level 0..1,
+    beat flags and spectral centroid. Auto-gain: each band is divided by its own
+    slowly-decaying recent peak, so quiet and loud music both fill the range."""
+    BANDS = {"bass": (20, 250), "mid": (250, 2000), "high": (2000, 8000)}
+    NOISE = 0.004            # below this a band counts as silence (no auto-gain blow-up)
+
+    def __init__(self, rate=48000):
+        self.rate = rate
+        self.peak = {k: self.NOISE for k in ("bass", "mid", "high", "level")}
+        self.bass_avg = 0.0
+        self.since_beat = 1.0
+
+    def feed(self, mono, dt, sensitivity=50):
+        n = len(mono)
+        win = np.hanning(n)
+        spec = np.abs(np.fft.rfft(mono * win)) / (win.sum() / 2)   # sine amp A -> ~A
+        freqs = np.fft.rfftfreq(n, 1.0 / self.rate)
+        raw = {b: float(np.sqrt(np.sum(spec[(freqs >= lo) & (freqs < hi)] ** 2)))
+               for b, (lo, hi) in self.BANDS.items()}
+        raw["level"] = float(np.sqrt(np.mean(mono ** 2)))
+        gain = 2.0 ** ((sensitivity - 50) / 25.0)                   # 0.25x .. 4x
+        decay = 0.5 ** (dt / 3.0)                                   # peak half-life 3 s
+        out = {}
+        for k, v in raw.items():
+            self.peak[k] = max(v, self.peak[k] * decay, self.NOISE)
+            out[k] = min(1.0, v / self.peak[k] * gain) if v > self.NOISE else 0.0
+        # beat = bass jumps well above its own ~1 s average (refractory 180 ms)
+        self.since_beat += dt
+        thresh = 1.65 - 0.5 * (sensitivity / 100.0)                 # 1.15 .. 1.65
+        beat = (raw["bass"] > self.bass_avg * thresh and out["bass"] > 0.35
+                and self.since_beat > 0.18)
+        if beat:
+            self.since_beat = 0.0
+        a = min(1.0, dt / 1.0)
+        self.bass_avg += (raw["bass"] - self.bass_avg) * a
+        band = (freqs >= 60) & (freqs < 8000)
+        tot = spec[band].sum()
+        out["centroid"] = float((freqs[band] * spec[band]).sum() / tot) if tot > 0 else 0.0
+        out["beat"] = beat
+        out["silent"] = raw["level"] <= self.NOISE
+        return out
+
+
+class AudioReactive:
+    """Captures system audio (WASAPI loopback) or a mic in its own thread, runs
+    AudioAnalyzer, and drives the strip through the coalescing 'color' slot."""
+    def __init__(self, ble, status_cb, color_cb, get_brightness, get_base_color, stopped_cb):
+        self.ble, self.status_cb, self.color_cb = ble, status_cb, color_cb
+        self.get_brightness, self.get_base_color = get_brightness, get_base_color
+        self.stopped_cb = stopped_cb        # called (from the thread) when capture ends
+        self.mode = "Pulse"
+        self.source = SYSTEM_AUDIO          # or a microphone name
+        self.sensitivity = 50               # 1..100
+        self.smoothing = 40                 # 0..100 -> release 0.05..1.0 s
+        self.floor = 8                      # min glow %, so the strip never goes black
+        self.feat = None                    # latest analysis, read by the UI meter
+        self.out_rgb = ((0, 0, 0), 0.0)     # latest (rgb, level) sent, for the meter
+        self.last_beat = 0.0                # perf_counter of the last beat, for the meter
+        self._running = False
+        self._reset()
+
+    def _reset(self):
+        self.env = 0.0
+        self.flash = 0.0
+        self.hue = 0.0
+        self.spec_rgb = np.zeros(3)
+
+    @property
+    def running(self):
+        return self._running
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._reset()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def stop(self):
+        self._running = False
+
+    @staticmethod
+    def list_sources():
+        import soundcard as sc
+        return [SYSTEM_AUDIO] + [m.name for m in sc.all_microphones()]
+
+    def render(self, f, dt):
+        """features -> (rgb at full brightness, level 0..1). Pure given state."""
+        tau = 0.05 + 0.95 * self.smoothing / 100.0
+        rel = math.exp(-dt / tau)
+
+        def follow(cur, x):                 # instant attack, smooth release
+            return x if x > cur else cur * rel + x * (1 - rel)
+
+        fl = self.floor / 100.0
+        base = self.get_base_color()
+        if self.mode == "Pulse":
+            self.env = follow(self.env, f["bass"])
+            return base, fl + (1 - fl) * self.env
+        if self.mode == "Beat flash":
+            self.flash = 1.0 if f["beat"] else self.flash * rel
+            return base, fl + (1 - fl) * self.flash
+        if self.mode == "Beat colors":
+            if f["beat"]:
+                self.hue = (self.hue + 0.381966) % 1.0      # golden step: far-apart hues
+                self.flash = 1.0
+            else:
+                self.flash *= rel
+            self.env = follow(self.env, f["level"])
+            return hs_rgb(self.hue, 1.0), fl + (1 - fl) * max(self.flash, 0.4 * self.env)
+        if self.mode == "Spectrum":
+            tgt = np.array([f["bass"], f["mid"], f["high"]])
+            self.spec_rgb = np.where(tgt > self.spec_rgb, tgt,
+                                     self.spec_rgb * rel + tgt * (1 - rel))
+            m = float(self.spec_rgb.max())
+            rgb = tuple(int(c / m * 255) for c in self.spec_rgb) if m > 0 else base
+            # bands set the hue mix; overall loudness sets brightness (a steady hiss
+            # auto-gains to ~1 in its band, so the max band would pin it at full)
+            self.env = follow(self.env, f["level"])
+            return rgb, fl + (1 - fl) * self.env
+        # "Pitch": spectral centroid 150 Hz .. 5 kHz -> hue red .. violet
+        c = f["centroid"]
+        if c > 0 and not f["silent"]:
+            t = (math.log2(max(c, 150)) - math.log2(150)) / (math.log2(5000) - math.log2(150))
+            tgt = 0.75 * min(1.0, t)
+            self.hue += (tgt - self.hue) * (1 - rel)
+        self.env = follow(self.env, f["level"])
+        return hs_rgb(self.hue, 1.0), fl + (1 - fl) * self.env
+
+    def _run(self):
+        import warnings
+        rate, block = 48000, 1024                    # ~21 ms per block, ~47 analyses/s
+        try:
+            import soundcard as sc
+            if self.source == SYSTEM_AUDIO:
+                mic = sc.get_microphone(id=str(sc.default_speaker().name),
+                                        include_loopback=True)
+            else:
+                mic = next((m for m in sc.all_microphones() if m.name == self.source), None)
+                if mic is None:
+                    raise RuntimeError(f"microphone not found: {self.source}")
+            an = AudioAnalyzer(rate)
+            ring = np.zeros(2048, dtype=np.float32)  # FFT window = last ~43 ms
+            last_ui = 0.0
+            self.status_cb(f"Audio reactive ON — {self.mode}")
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")      # soundcard warns on harmless gaps
+                with mic.recorder(samplerate=rate, channels=1, blocksize=block) as rec:
+                    while self._running:
+                        data = rec.record(numframes=block)
+                        mono = data.reshape(len(data), -1).mean(axis=1).astype(np.float32)
+                        ring = np.concatenate([ring, mono])[-2048:]
+                        dt = len(mono) / rate
+                        f = an.feed(ring, dt, self.sensitivity)
+                        rgb, lvl = self.render(f, dt)
+                        self.feat, self.out_rgb = f, (tuple(rgb), lvl)
+                        if f["beat"]:
+                            self.last_beat = time.perf_counter()
+                        s = self.get_brightness() / 100.0 * lvl
+                        r, g, b = rgb
+                        self.ble.queue("color", cmd_color(int(r * s), int(g * s), int(b * s)))
+                        now = time.perf_counter()
+                        if now - last_ui > SEND_INTERVAL:   # UI tint at the strip's rate
+                            last_ui = now
+                            self.color_cb(tuple(rgb))
+        except Exception as e:
+            self.status_cb(f"Audio stopped: {e}")
+        finally:
+            self._running = False
+            self.feat = None
+            self.stopped_cb()
+
+
+class NotificationWatcher:
+    """Polls Windows' notification center about once a second in its own thread.
+    on_new(is_call) fires for each new toast; on_call_end() when every ringing call
+    toast is gone (answered/declined). Toasts already there at start are ignored."""
+    def __init__(self, on_new, on_call_end, status_cb):
+        self.on_new, self.on_call_end, self.status_cb = on_new, on_call_end, status_cb
+        self._stop = threading.Event()
+        self._thread = None
+
+    @property
+    def running(self):
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self):
+        if self.running:
+            self._stop.clear()               # stop() was asked but it hasn't exited yet
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=lambda: asyncio.run(self._poll()), daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+
+    @staticmethod
+    def _text(note):
+        """App name + visible text lines of a toast (empty on anything odd)."""
+        parts = []
+        try:
+            parts.append(note.app_info.display_info.display_name)
+        except Exception:
+            pass
+        try:
+            b = note.notification.visual.get_binding(KnownNotificationBindings.toast_generic)
+            parts += [t.text for t in b.get_text_elements()] if b else []
+        except Exception:
+            pass
+        return " ".join(p for p in parts if p)
+
+    async def _poll(self):
+        try:
+            listener = UserNotificationListener.current
+            status = await listener.request_access_async()
+        except Exception as e:
+            self.status_cb(f"Notification alerts unavailable: {e}")
+            return
+        if status != UserNotificationListenerAccessStatus.ALLOWED:
+            self.status_cb("Windows blocked notification access — allow it in "
+                           "Settings › Privacy & security › Notifications")
+            return
+        seen, calls = None, set()
+        while not self._stop.is_set():
+            try:
+                notes = {n.id: n for n in
+                         await listener.get_notifications_async(NotificationKinds.TOAST)}
+            except Exception:
+                await asyncio.sleep(5.0)     # notification service hiccup: try again
+                continue
+            if seen is not None:             # first pass only learns what's already there
+                for nid in notes.keys() - seen:
+                    call = is_call(self._text(notes[nid]))
+                    if call:
+                        calls.add(nid)
+                    self.on_new(call)
+            if calls and not calls & notes.keys():
+                self.on_call_end()
+            calls &= notes.keys()
+            seen = set(notes)
+            await asyncio.sleep(1.0)
+
+
 class App:
-    def __init__(self, root):
+    def __init__(self, root, lock=None):
         self.root = root
         self.ble = BleWorker(self.set_status, self.set_connected)
-        self.base_color = (255, 255, 255)   # current color before brightness scaling
-        self.brightness = 100               # percent
-
-        root.title("ELK-BLEDOM Controller")
-        root.configure(padx=16, pady=14)
-        root.resizable(False, False)
-
-        # --- connection row (with live indicator) ---
-        top = tk.Frame(root)
-        top.pack(fill="x", pady=(0, 10))
-        tk.Button(top, text="Scan", width=7, command=self.on_scan).pack(side="left")
-        tk.Button(top, text="Connect", width=8, command=self.on_connect).pack(side="left", padx=4)
-        tk.Button(top, text="Disconnect", width=9, command=self.on_disconnect).pack(side="left")
-        self.dot = tk.Canvas(top, width=16, height=16, highlightthickness=0)
-        self.dot.pack(side="right")
-        self._dot_id = self.dot.create_oval(2, 2, 14, 14, fill="#c62828", outline="")
-        tk.Label(top, text="link:").pack(side="right", padx=(0, 3))
-
-        # --- power row ---
-        pw = tk.Frame(root)
-        pw.pack(fill="x", pady=4)
-        tk.Button(pw, text="ON",  width=12, height=2, bg="#2e7d32", fg="white",
-                  command=lambda: self.send(cmd_on())).pack(side="left", expand=True, fill="x", padx=(0, 4))
-        tk.Button(pw, text="OFF", width=12, height=2, bg="#b71c1c", fg="white",
-                  command=lambda: self.send(cmd_off())).pack(side="left", expand=True, fill="x")
-
-        # --- color swatch + picker ---
-        tk.Label(root, text="Color", anchor="w").pack(fill="x", pady=(12, 2))
-        self.swatch = tk.Label(root, bg="#ffffff", height=2, relief="sunken", bd=1)
-        self.swatch.pack(fill="x")
-        cbtn = tk.Frame(root)
-        cbtn.pack(fill="x", pady=6)
-        tk.Button(cbtn, text="Pick color...", command=self.on_pick).pack(side="left")
-
-        presets = tk.Frame(root)
-        presets.pack(fill="x")
-        for i, (label, rgb) in enumerate(PRESETS):
-            hexc = "#%02x%02x%02x" % rgb
-            b = tk.Button(presets, text=label, bg=hexc,
-                          fg="black" if sum(rgb) > 380 else "white",
-                          width=8, command=lambda c=rgb: self.set_color(c))
-            b.grid(row=i // 3, column=i % 3, padx=2, pady=2, sticky="ew")
-        for c in range(3):
-            presets.columnconfigure(c, weight=1)
-
-        # --- brightness ---
-        tk.Label(root, text="Brightness", anchor="w").pack(fill="x", pady=(12, 0))
-        self.bright = tk.Scale(root, from_=1, to=100, orient="horizontal",
-                               command=self.on_brightness)
-        self.bright.set(100)
-        self.bright.pack(fill="x")
-
-        # --- effects ---
-        tk.Label(root, text="Effect", anchor="w").pack(fill="x", pady=(12, 0))
-        er = tk.Frame(root)
-        er.pack(fill="x")
-        self.effect_var = tk.StringVar(value=list(EFFECTS)[0])
-        ttk.Combobox(er, textvariable=self.effect_var, values=list(EFFECTS),
-                     state="readonly", width=22).pack(side="left", fill="x", expand=True)
-        tk.Button(er, text="Apply", command=self.on_effect).pack(side="left", padx=4)
-
-        tk.Label(root, text="Effect speed", anchor="w").pack(fill="x", pady=(10, 0))
-        self.speed = tk.Scale(root, from_=1, to=100, orient="horizontal",
-                              command=self.on_speed)
-        self.speed.set(50)
-        self.speed.pack(fill="x")
-
-        # --- screen sync (ambilight) ---
-        ttk.Separator(root, orient="horizontal").pack(fill="x", pady=(14, 8))
-        tk.Label(root, text="Screen Sync (Ambilight)",
-                 font=("", 9, "bold"), anchor="w").pack(fill="x")
+        cfg = load_settings()
+        self._saved = cfg                   # last state written to disk
+        self.base_color = tuple(cfg["color"])  # current color before brightness scaling
+        self.brightness = cfg["brightness"]    # percent
+        self.mode = cfg["mode"]             # what the strip shows: "color" | "effect"
+        self.custom = [tuple(c) for c in cfg["custom"]]   # saved picker colors
+        self.scenes = {n: dict(sc) for n, sc in cfg["scenes"].items()}  # name -> snapshot
+        self._picker = None                 # open picker window, if any
+        self.soft = None                    # running software effect, if any
+        self._soft_job = None              # its pending root.after id
 
         self.sync = ScreenSync(self.ble, self.set_status,
                                self.set_sync_swatch, lambda: self.brightness)
+        self.sync.style = cfg["style"]
+        self.sync.extract_mode = cfg["extract"]
+        self.sync.dark_mode = cfg["dark"]
+
+        self.audio = AudioReactive(self.ble, self.set_status, self.set_sync_swatch,
+                                   lambda: self.brightness, lambda: self.base_color,
+                                   lambda: self.root.after(0, self._audio_stopped))
+        self.audio.mode = cfg["audio_mode"]
+        self.audio.source = cfg["audio_source"]
+        self.audio.sensitivity = cfg["audio_sens"]
+        self.audio.smoothing = cfg["audio_smooth"]
+        self.audio.floor = cfg["audio_floor"]
+
+        # plain bools (not Tk vars): the watcher thread reads them
+        self.notify_flash, self.notify_call = cfg["notify_flash"], cfg["notify_call"]
+        self.notifier = NotificationWatcher(
+            self._on_notification, lambda: setattr(self.ble, "alert_cancel", True),
+            self.set_status)
+
+        root.title("RGBZap — LED Console")
+        root.configure(bg=INK, padx=14, pady=14)
+        root.resizable(False, True)   # fixed width, resizable height
+        try:                          # title bar + taskbar icon
+            root.iconbitmap(default=os.path.join(ASSETS, "rgbzap.ico"))
+        except tk.TclError:
+            pass
+        self._init_style(root)
+
+        # === header: app mark + live connection pill =====================
+        head = tk.Frame(root, bg=INK)
+        head.pack(fill="x")
+        try:
+            self._logo = tk.PhotoImage(file=os.path.join(ASSETS, "header.png"))
+            tk.Label(head, image=self._logo, bg=INK, bd=0).pack(side="left")
+        except tk.TclError:           # assets missing: plain wordmark
+            tk.Label(head, text="RGBZAP", font=FONT_H1, fg=TEXT, bg=INK).pack(side="left")
+        tk.Label(head, text="LED CONSOLE", font=FONT_EYE, fg=MUTE, bg=INK
+                 ).pack(side="left", padx=(10, 0), pady=(20, 0))
+        pill = tk.Frame(head, bg=INK)
+        pill.pack(side="right")
+        self.link_lbl = tk.Label(pill, text="Offline", font=FONT_MONO, fg=BAD, bg=INK)
+        self.link_lbl.pack(side="right")
+        self.dot = tk.Canvas(pill, width=14, height=14, bg=INK, highlightthickness=0)
+        self.dot.pack(side="right", padx=(0, 6))
+        self._dot_id = self.dot.create_oval(2, 2, 12, 12, fill=BAD, outline="")
+
+        # === aura bar: the signature — glows the strip's current color ====
+        self.aura = tk.Frame(root, bg="#ffffff", height=5)
+        self.aura.pack(fill="x", pady=(12, 12))
+
+        # === status readout (built early so worker callbacks are safe) ====
+        self.status = tk.Label(root, text="Ready", anchor="w", fg=MUTE, bg=PANEL2,
+                               font=FONT_MONO, padx=10, pady=6)
+        self.status.pack(side="bottom", fill="x", pady=(12, 0))
+
+        # === tabbed deck ==================================================
+        self.tabbar = tk.Canvas(root, height=36, bg=INK, highlightthickness=0, bd=0)
+        self.tabbar.pack(fill="x")
+        nb = ttk.Notebook(root, style="Deck.TNotebook")
+        nb.pack(fill="both", expand=True)
+        self.nb = nb
+        light = self._tab(nb, "LIGHT")
+        fx = self.fx_tab = self._tab(nb, "EFFECTS")
+        screen = self._tab(nb, "SCREEN")
+        audio = self._tab(nb, "AUDIO")
+        system = self._tab(nb, "SYSTEM")
+        self._build_tabbar()
+
+        # ---- LIGHT tab ----
+        # strip picker: pick a strip to connect + save it; ↻ scans; switch = link on/off
+        self.strips = [list(s) for s in cfg["strips"]]   # saved [name, address]
+        self._found = []                                 # last scan, not yet saved
+        self._choices = []                               # (name, address) per combo row
+        self._eyebrow(light, "Light strip").pack(fill="x")
+        lr = tk.Frame(light, bg=PANEL)
+        lr.pack(fill="x", pady=(4, 14))
+        self.strip_var = tk.StringVar()
+        self.strip_cb = self._combo(lr, self.strip_var, [], 20, self.on_strip_pick)
+        self.strip_cb.pack(side="left", fill="x", expand=True)
+        self.link_sw = tk.Canvas(lr, width=44, height=24, bg=PANEL, highlightthickness=0,
+                                 cursor="hand2")
+        self.link_sw.pack(side="right", padx=(8, 0))
+        self.link_sw.bind("<Button-1>", lambda _e: self.on_link_toggle())
+        self.scan_btn = self._flat(lr, "↻", self.on_strip_scan, pady=3)
+        self.scan_btn.config(padx=8, font=("Segoe UI Symbol", 11))
+        self.scan_btn.pack(side="right", padx=(6, 0))
+        self._refresh_strips(self._saved_address())
+        self._draw_link(True)                 # launch auto-connects right away
+
+        self._eyebrow(light, "Current color").pack(fill="x")
+        self.swatch = tk.Label(light, bg="#ffffff", height=3, bd=0)
+        self.swatch.pack(fill="x", pady=(4, 6))
+        hexrow = tk.Frame(light, bg=PANEL)
+        hexrow.pack(fill="x")
+        self.hex_val = tk.Label(hexrow, text="#FFFFFF", font=FONT_HEX, fg=TEXT, bg=PANEL)
+        self.hex_val.pack(side="left")
+        self._flat(hexrow, "Pick color", self.on_pick).pack(side="right")
+
+        pw = tk.Frame(light, bg=PANEL)
+        pw.pack(fill="x", pady=(12, 0))
+        self._flat(pw, "Turn on", lambda: self.send(cmd_on()), bg=GOOD, fg=INK,
+                   hover="#5FE3B4").pack(side="left", expand=True, fill="x", padx=(0, 5))
+        self._flat(pw, "Turn off", self.on_off, bg=PANEL2, fg=TEXT,
+                   hover=LINE).pack(side="left", expand=True, fill="x")
+
+        # scenes: pick one to apply it; Save stores the current look under a name
+        self._eyebrow(light, "Scenes").pack(fill="x", pady=(14, 2))
+        sr = tk.Frame(light, bg=PANEL)
+        sr.pack(fill="x")
+        self.scene_var = tk.StringVar()
+        self.scene_cb = self._combo(sr, self.scene_var, list(self.scenes), 20,
+                                    lambda _e: self.apply_scene(self.scene_var.get()))
+        self.scene_cb.pack(side="left", fill="x", expand=True)
+        self._flat(sr, "Delete", self.on_scene_delete).pack(side="right", padx=(6, 0))
+        self._flat(sr, "Save", self.on_scene_save).pack(side="right", padx=(6, 0))
+
+        # saved picker colors sit above the presets; right-click a chip to remove it
+        self._eyebrow(light, "Custom").pack(fill="x", pady=(14, 6))
+        self.custom_row = tk.Frame(light, bg=PANEL, height=22)
+        self.custom_row.pack(fill="x")
+        self._render_custom()
+
+        self._eyebrow(light, "Presets").pack(fill="x", pady=(14, 6))
+        presets = tk.Frame(light, bg=PANEL)
+        presets.pack(fill="x")
+        # small nameless color chips — one tight row, the color is the label
+        for _label, rgb in PRESETS:
+            self._chip(presets, rgb)
+
+        self._eyebrow(light, "Brightness").pack(fill="x", pady=(14, 2))
+        self.bright = self._gauge(light, 1, 100, self.on_brightness, cfg["brightness"], "%")
+
+        # ---- EFFECTS tab: every effect as a live preview tile; click one to apply ----
+        self.effect_var = tk.StringVar(value=cfg["effect"])
+        self._eyebrow(fx, "Speed").pack(fill="x", pady=(0, 2))
+        self.speed = self._gauge(fx, 1, 100, self.on_speed, cfg["speed"], "%")
+        fr = tk.Frame(fx, bg=PANEL)
+        fr.pack(fill="both", expand=True, pady=(12, 0))
+        self.fx_canvas = tk.Canvas(fr, bg=PANEL, highlightthickness=0, bd=0, height=360)
+        sb = ttk.Scrollbar(fr, orient="vertical", command=self.fx_canvas.yview,
+                           style="RGBZap.Vertical.TScrollbar")
+        self.fx_canvas.config(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y", padx=(6, 0))
+        self.fx_canvas.pack(side="left", fill="both", expand=True)
+        self.fx_canvas.bind("<Configure>", self._fx_layout)
+        self.fx_canvas.bind("<Enter>", lambda _e: self.fx_canvas.bind_all(
+            "<MouseWheel>", lambda e: self.fx_canvas.yview_scroll(int(-e.delta / 120), "units")))
+        self.fx_canvas.bind("<Leave>", lambda _e: self.fx_canvas.unbind_all("<MouseWheel>"))
+        self._fx_tiles = {}                  # effect name (None = no effect) -> canvas items
+        self._fx_w = 0
+        self._fx_shown = {}                  # tile -> last drawn color (skip no-op redraws)
+        self._fx_active = False              # last highlighted tile (False = not drawn yet)
+        self._fx_t = 0.0                     # preview clock for the strip's built-ins
+        self._fx_prev = {n: make() for n, make in SOFT_EFFECTS.items()}  # own instances
+        self.root.after(80, self._fx_tick)
+
+        # ---- SCREEN tab ----
         try:
             self._monitors = ScreenSync.list_monitors()   # [(index, label), ...]
         except Exception as e:
             self._monitors = []
-            self.set_status(f"Monitor detection failed: {e}")
+            self.set_status(f"Couldn't detect displays: {e}")
 
-        sr = tk.Frame(root)
-        sr.pack(fill="x", pady=(4, 0))
-        tk.Label(sr, text="Display:").pack(side="left")
+        self._eyebrow(screen, "Display").pack(fill="x")
         self.display_var = tk.StringVar()
-        labels = [lbl for _, lbl in self._monitors] or ["(none found)"]
-        self.display_cb = ttk.Combobox(sr, textvariable=self.display_var,
-                                       values=labels, state="readonly", width=20)
-        self.display_cb.current(0)
-        self.display_cb.pack(side="left", padx=4, fill="x", expand=True)
-        self.display_cb.bind("<<ComboboxSelected>>", self.on_display_change)
+        labels = [lbl for _, lbl in self._monitors] or ["No display found"]
+        self.display_cb = self._combo(screen, self.display_var, labels, 24,
+                                      self.on_display_change)
+        # restore the saved display by label; fall back to the first if it's gone
+        self.display_cb.current(labels.index(cfg["display"])
+                                if cfg["display"] in labels else 0)
+        self.display_cb.pack(fill="x", pady=(4, 0))
 
-        sr2 = tk.Frame(root)
-        sr2.pack(fill="x", pady=(6, 0))
-        tk.Label(sr2, text="Style:").pack(side="left")
-        self.style_var = tk.StringVar(value="Balanced")
-        style_cb = ttk.Combobox(sr2, textvariable=self.style_var,
-                                values=list(SYNC_STYLES), state="readonly", width=12)
-        style_cb.pack(side="left", padx=4)
-        style_cb.bind("<<ComboboxSelected>>", self.on_style_change)
-        tk.Label(sr2, text="Smoothing:").pack(side="left", padx=(8, 0))
-        self.smooth = tk.Scale(sr2, from_=5, to=100, orient="horizontal",
-                               showvalue=False, command=self.on_smooth, length=90)
-        self.smooth.set(30)
-        self.smooth.pack(side="left", fill="x", expand=True)
+        grid = tk.Frame(screen, bg=PANEL)
+        grid.pack(fill="x", pady=(12, 0))
+        self.style_var = tk.StringVar(value=cfg["style"])
+        self.extract_var = tk.StringVar(value=cfg["extract"])
+        self.dark_var = tk.StringVar(value=cfg["dark"])
+        self._field(grid, 0, "Style", self.style_var, list(SYNC_STYLES),
+                    self.on_style_change)
+        self._field(grid, 1, "Extract", self.extract_var, ["Dominant", "Average"],
+                    lambda e: setattr(self.sync, "extract_mode", self.extract_var.get()))
+        self._field(grid, 2, "Dark scenes", self.dark_var, ["Dim", "Glow", "Keep"],
+                    lambda e: setattr(self.sync, "dark_mode", self.dark_var.get()))
+        grid.columnconfigure(1, weight=1)
 
-        self.sync_btn = tk.Button(root, text="▶ Start Screen Sync", height=2,
-                                  bg="#1565c0", fg="white", command=self.on_toggle_sync)
-        self.sync_btn.pack(fill="x", pady=(6, 0))
-        # apply the initially-selected display index
+        self._eyebrow(screen, "Saturation").pack(fill="x", pady=(14, 2))
+        self.sat_scale = self._gauge(screen, 100, 250, self.on_sat, cfg["sat"], "%")
+        self.on_sat(cfg["sat"])
+        self._eyebrow(screen, "Smoothing").pack(fill="x", pady=(10, 2))
+        self.smooth = self._gauge(screen, 5, 100, self.on_smooth, cfg["smooth"], "%")
+        self.on_smooth(cfg["smooth"])
+
+        self.sync_btn = self._flat(screen, "▶  Start screen sync", self.on_toggle_sync,
+                                   bg=SYNC_BLUE, fg="white", hover="#5A97F8", pady=11,
+                                   hoverable=False)
+        self.sync_btn.pack(fill="x", pady=(16, 0))
         self.on_display_change()
 
-        # --- run at startup ---
-        ttk.Separator(root, orient="horizontal").pack(fill="x", pady=(12, 6))
+        # ---- AUDIO tab ----
+        try:
+            sources = AudioReactive.list_sources()
+        except Exception as e:                  # soundcard missing / no audio devices
+            sources = [SYSTEM_AUDIO]
+            self.set_status(f"Audio devices unavailable: {e}")
+        self._eyebrow(audio, "Listen to").pack(fill="x")
+        self.audio_src_var = tk.StringVar(
+            value=cfg["audio_source"] if cfg["audio_source"] in sources else SYSTEM_AUDIO)
+        self.audio.source = self.audio_src_var.get()
+        self._combo(audio, self.audio_src_var, sources, 24,
+                    lambda _e: self._audio_set("source", self.audio_src_var.get())
+                    ).pack(fill="x", pady=(4, 0))
+
+        self._eyebrow(audio, "Mode").pack(fill="x", pady=(12, 2))
+        self.audio_mode_var = tk.StringVar(value=cfg["audio_mode"])
+        self._combo(audio, self.audio_mode_var, list(AUDIO_MODES), 24,
+                    self.on_audio_mode).pack(fill="x")
+        self.audio_desc = tk.Label(audio, text=AUDIO_MODES[cfg["audio_mode"]],
+                                   font=FONT_BODY, fg=MUTE, bg=PANEL, anchor="w")
+        self.audio_desc.pack(fill="x", pady=(4, 0))
+
+        # live meter: bass / mid / high bars, a beat light, and the output color
+        self._eyebrow(audio, "Live").pack(fill="x", pady=(12, 4))
+        self.meter = tk.Canvas(audio, height=74, bg=PANEL2, highlightthickness=0, bd=0)
+        self.meter.pack(fill="x")
+        self._meter_bars = {}
+        for i, (key, label) in enumerate((("bass", "BASS"), ("mid", "MID"), ("high", "HIGH"))):
+            y = 12 + i * 20
+            self.meter.create_text(10, y + 5, text=label, anchor="w", fill=MUTE, font=FONT_EYE)
+            self.meter.create_rectangle(52, y, 52, y + 10, fill=PANEL, outline="", tags="track")
+            self._meter_bars[key] = self.meter.create_rectangle(52, y, 52, y + 10,
+                                                                fill=TEXT, outline="")
+        self._meter_beat = self.meter.create_oval(0, 0, 0, 0, fill=PANEL, outline=LINE)
+        self._meter_out = self.meter.create_rectangle(0, 0, 0, 0, fill=PANEL, outline=LINE)
+        self.meter.bind("<Configure>", lambda _e: self._draw_meter())
+
+        self._eyebrow(audio, "Sensitivity").pack(fill="x", pady=(12, 2))
+        self._gauge(audio, 1, 100, lambda v: self._audio_set("sensitivity", int(float(v))),
+                    cfg["audio_sens"], "%")
+        self._eyebrow(audio, "Smoothing").pack(fill="x", pady=(8, 2))
+        self._gauge(audio, 0, 100, lambda v: self._audio_set("smoothing", int(float(v))),
+                    cfg["audio_smooth"], "%")
+        self._eyebrow(audio, "Min glow").pack(fill="x", pady=(8, 2))
+        self._gauge(audio, 0, 50, lambda v: self._audio_set("floor", int(float(v))),
+                    cfg["audio_floor"], "%")
+
+        self.audio_btn = self._flat(audio, "▶  Start audio reactive", self.on_toggle_audio,
+                                    bg=AUDIO_PINK, fg="white", hover="#E86AB1", pady=11,
+                                    hoverable=False)
+        self.audio_btn.pack(fill="x", pady=(16, 0))
+
+        # ---- SYSTEM tab ----
+        self._eyebrow(system, "Startup").pack(fill="x", pady=(0, 4))
+        migrate_startup()
         self.startup_var = tk.BooleanVar(value=startup_enabled())
-        cb = tk.Checkbutton(root, text="Run automatically when Windows starts",
-                            variable=self.startup_var, command=self.on_startup_toggle,
-                            anchor="w")
+        cb = self._check(system, "Open automatically when Windows starts",
+                         self.startup_var, self.on_startup_toggle)
         if winreg is None:
             cb.config(state="disabled")  # non-Windows: not supported
+
+        # notification alerts: the strip flashes / pulses, then goes back to what it showed
+        self._eyebrow(system, "Notifications").pack(fill="x", pady=(16, 4))
+        self.flash_var = tk.BooleanVar(value=self.notify_flash)
+        self.call_var = tk.BooleanVar(value=self.notify_call)
+        checks = [self._check(system, "Flash when a notification arrives", self.flash_var,
+                              self.on_notify_toggle),
+                  self._check(system, "Pulse green while a call is ringing", self.call_var,
+                              self.on_notify_toggle)]
+        tr = tk.Frame(system, bg=PANEL)
+        tr.pack(fill="x", pady=(8, 0))
+        tests = [self._flat(tr, "Test notification", lambda: self.on_alert_test("notify")),
+                 self._flat(tr, "Test call", lambda: self.on_alert_test("call"))]
+        tests[0].pack(side="left", expand=True, fill="x", padx=(0, 5))
+        tests[1].pack(side="left", expand=True, fill="x")
+        if UserNotificationListener is None:  # winrt notification packages missing
+            for w in checks:
+                w.config(state="disabled")
+            tk.Label(system, text="Needs the winrt notification packages (requirements.txt)",
+                     font=FONT_BODY, fg=MUTE, bg=PANEL, anchor="w").pack(fill="x", pady=(6, 0))
+        self.on_notify_toggle()
+
+        # lock a consistent width; let height be resized (min keeps it usable)
+        root.update_idletasks()
+        width = max(380, root.winfo_reqwidth())
+        root.geometry(f"{width}x{root.winfo_reqheight()}")
+        root.minsize(width, 480)
+        root.maxsize(width, root.winfo_screenheight())
+
+        root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
+        self._tray = None
+        self._tray_hint_shown = False
+        try:
+            self._start_tray()
+        except Exception as e:                # tray is a convenience, never fatal
+            self._tray = None
+            self.set_status(f"Tray unavailable: {e}")
+        if lock is not None:
+            self._listen_for_second_launch(lock)
+        self._paint(self.base_color)          # show the restored color
+        # play the "connected" ripple on user/launch connects, unless a sync owns the strip
+        self.ble.fx_provider = self._fx_params
+        # auto-connect on launch, then resume the saved effect if one was running
+        resume = (cfg["effect"], cfg["speed"]) if self.mode == "effect" else None
+        self.ble.submit(self._launch(resume))
+        self.root.after(2000, self._autosave)
+
+    async def _launch(self, resume):
+        await self.ble._connect(fx=True)
+        if not resume:
+            return
+        name, speed = resume
+        if name in SOFT_EFFECTS:
+            self.root.after(0, self._start_soft, name)   # flame ticks on the Tk thread
+        else:
+            await self.ble._write(cmd_effect(EFFECTS[name]))
+            await self.ble._write(cmd_effect_speed(speed))
+
+    # ---- settings persistence ----
+    def _snapshot(self):
+        return {
+            "color": list(self.base_color), "brightness": self.brightness,
+            "mode": self.mode, "effect": self.effect_var.get(),
+            "speed": int(float(self.speed.get())), "display": self.display_var.get(),
+            "style": self.sync.style, "extract": self.sync.extract_mode,
+            "dark": self.sync.dark_mode, "sat": round(self.sync.sat * 100),
+            "smooth": round(self.sync.alpha * 100),
+            "custom": [list(c) for c in self.custom],
+            "strips": [list(s) for s in self.strips],
+            "notify_flash": self.notify_flash, "notify_call": self.notify_call,
+            "audio_mode": self.audio.mode, "audio_source": self.audio.source,
+            "audio_sens": self.audio.sensitivity, "audio_smooth": self.audio.smoothing,
+            "audio_floor": self.audio.floor,
+            # copies, so later edits to self.scenes still differ from the saved state
+            "scenes": {n: {**sc, "color": list(sc["color"])} for n, sc in self.scenes.items()},
+        }
+
+    def _save(self):
+        """Write settings only if something changed since the last write."""
+        cfg = self._snapshot()
+        if cfg == self._saved:
+            return
+        try:
+            save_settings(cfg)
+            self._saved = cfg
+        except OSError as e:
+            self.set_status(f"Couldn't save settings: {e}")
+
+    def _autosave(self):
+        # ponytail: 2s poll instead of a save hook in every callback; also survives
+        # Windows shutdown, which can kill the app without calling on_close.
+        self._save()
+        self.root.after(2000, self._autosave)
+
+    def _fx_params(self):
+        if self.sync.running or self.audio.running:
+            return None                      # don't hijack an active sync
+        return self.base_color, self.brightness
+
+    # ---- theme + widget factories ----
+    def _init_style(self, root):
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("Deck.TNotebook", background=INK, borderwidth=0,
+                        bordercolor=INK, lightcolor=INK, darkcolor=INK, tabmargins=0)
+        # native tabs hidden: _build_tabbar draws RGBZap's own (clam's tabs grow when
+        # selected and can't take the lit-strip indicator)
+        style.layout("Deck.TNotebook.Tab", [])
+        style.configure("Dark.TCombobox", fieldbackground=PANEL2, background=PANEL2,
+                        foreground=TEXT, arrowcolor=MUTE, bordercolor=LINE,
+                        lightcolor=PANEL2, darkcolor=PANEL2, borderwidth=1,
+                        padding=5, selectbackground=PANEL2, selectforeground=TEXT)
+        style.map("Dark.TCombobox", fieldbackground=[("readonly", PANEL2)],
+                  bordercolor=[("focus", LINE)])
+        # light slider knob on a dark trough so it's clearly visible
+        style.configure("RGBZap.Horizontal.TScale", troughcolor=PANEL2,
+                        background=TEXT, bordercolor=LINE, lightcolor=TEXT,
+                        darkcolor=MUTE, borderwidth=0)
+        style.map("RGBZap.Horizontal.TScale",
+                  background=[("active", "#FFFFFF")])
+        # slim arrowless scrollbar for the effects grid
+        style.layout("RGBZap.Vertical.TScrollbar", [("Vertical.Scrollbar.trough", {
+            "sticky": "ns", "children": [("Vertical.Scrollbar.thumb",
+                                          {"expand": "1", "sticky": "nswe"})]})])
+        style.configure("RGBZap.Vertical.TScrollbar", troughcolor=PANEL, background="#3A4354",
+                        bordercolor=PANEL, lightcolor="#3A4354", darkcolor="#3A4354",
+                        arrowsize=6, width=6, gripcount=0)
+        style.map("RGBZap.Vertical.TScrollbar", background=[("active", MUTE)])
+        root.option_add("*TCombobox*Listbox.background", PANEL2)
+        root.option_add("*TCombobox*Listbox.foreground", TEXT)
+        root.option_add("*TCombobox*Listbox.selectBackground", LINE)
+        root.option_add("*TCombobox*Listbox.selectForeground", TEXT)
+        root.option_add("*TCombobox*Listbox.font", FONT_BODY)
+
+    def _tab(self, nb, title):
+        f = tk.Frame(nb, bg=PANEL, padx=16, pady=16)
+        nb.add(f, text=title)
+        return f
+
+    def _eyebrow(self, parent, text):
+        return tk.Label(parent, text=text.upper(), font=FONT_EYE, fg=MUTE, bg=PANEL,
+                        anchor="w")
+
+    def _flat(self, parent, text, cmd, bg=PANEL2, fg=TEXT, hover=LINE, pady=8,
+              hoverable=True):
+        b = tk.Button(parent, text=text, command=cmd, bg=bg, fg=fg, bd=0,
+                      relief="flat", font=FONT_BTN, cursor="hand2",
+                      highlightthickness=0, activebackground=hover,
+                      activeforeground=fg, padx=12, pady=pady)
+        if hoverable:
+            # toggle buttons manage their own bg by state, so they opt out
+            b.bind("<Enter>", lambda e: b.config(bg=hover))
+            b.bind("<Leave>", lambda e: b.config(bg=bg))
+        return b
+
+    def _check(self, parent, text, var, cmd):
+        cb = tk.Checkbutton(parent, text=text, variable=var, command=cmd, anchor="w",
+                            font=FONT_BODY, fg=TEXT, bg=PANEL, selectcolor=PANEL2,
+                            activebackground=PANEL, activeforeground=TEXT,
+                            highlightthickness=0, bd=0)
         cb.pack(fill="x")
+        return cb
 
-        # --- status bar ---
-        self.status = tk.Label(root, text="Ready", anchor="w", fg="#555",
-                               relief="sunken", bd=1, padx=6)
-        self.status.pack(fill="x", pady=(14, 0))
+    def _gauge(self, parent, frm, to, cmd, init, suffix=""):
+        """A themed slider with a light knob and a live Consolas value readout.
+        Packs itself into `parent`; returns the ttk.Scale (for .set / reads)."""
+        row = tk.Frame(parent, bg=PANEL)
+        row.pack(fill="x")
+        val = tk.Label(row, text=f"{init}{suffix}", font=FONT_MONO, fg=TEXT, bg=PANEL,
+                       width=5, anchor="e")
+        val.pack(side="right")
 
-        root.protocol("WM_DELETE_WINDOW", self.on_close)
-        # auto-connect on launch
-        self.ble.submit(self.ble._connect())
+        def wrapped(v):
+            val.config(text=f"{int(float(v))}{suffix}")
+            cmd(v)
+
+        s = ttk.Scale(row, from_=frm, to=to, orient="horizontal", command=wrapped,
+                      style="RGBZap.Horizontal.TScale")
+        s.set(init)
+        s.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        return s
+
+    def _combo(self, parent, var, values, width, cmd=None):
+        cb = ttk.Combobox(parent, textvariable=var, values=values, state="readonly",
+                          width=width, style="Dark.TCombobox", font=FONT_BODY)
+        if cmd:
+            cb.bind("<<ComboboxSelected>>", cmd)
+        return cb
+
+    def _field(self, grid, row, label, var, values, cmd):
+        tk.Label(grid, text=label, font=FONT_BODY, fg=MUTE, bg=PANEL, anchor="w"
+                 ).grid(row=row, column=0, sticky="w", pady=4, padx=(0, 10))
+        self._combo(grid, var, values, 14, cmd).grid(row=row, column=1, sticky="ew",
+                                                      pady=4)
 
     # ---- thread-safe UI updates ----
     def set_status(self, text):
         self.root.after(0, lambda: self.status.config(text=text))
 
     def set_connected(self, state):
-        color = "#2e7d32" if state else "#c62828"
-        self.root.after(0, lambda: self.dot.itemconfig(self._dot_id, fill=color))
+        color = GOOD if state else BAD
+        txt = "Connected" if state else "Offline"
+        def _apply():
+            self.dot.itemconfig(self._dot_id, fill=color)
+            self.link_lbl.config(text=txt, fg=color)
+            addr = self.ble.address
+            if state and addr:                # auto-connected strips get saved too
+                self._remember_strip("Light strip", addr)
+                self._refresh_strips(addr)
+            self._draw_link()
+        self.root.after(0, _apply)
 
     def send(self, payload):
         self.ble.submit(self.ble._write(payload))
@@ -567,37 +1780,514 @@ class App:
         # coalesced channel: rapid slider drags collapse to the latest color
         self.ble.queue("color", cmd_color(int(r * s), int(g * s), int(b * s)))
 
+    def _paint(self, rgb):
+        """Tint the live-color UI (swatch, aura bar, hex readout) to rgb."""
+        hexc = "#%02x%02x%02x" % rgb
+        self.swatch.config(bg=hexc)
+        self.aura.config(bg=hexc)
+        self.hex_val.config(text=hexc.upper())
+        self._tab_glow(rgb)
+
+    # ---- tab bar: spaced labels over a hairline; the selected one sits on a tiny
+    # lit LED strip in the strip's live color that slides between tabs ----
+    _GLOW_ROWS = 7                            # light spill above the strip, px
+
+    def _build_tabbar(self):
+        c = self.tabbar
+        self._tab_labels = []
+        for i, f in enumerate(self.nb.tabs()):
+            title = self.nb.tab(f, "text")
+            t = c.create_text(0, 15, text=title, font=FONT_TAB, fill=MUTE,
+                              tags=f"tab{i}")
+            hit = c.create_rectangle(0, 0, 0, 0, fill=INK, outline="", tags=f"tab{i}")
+            c.tag_lower(hit)
+            c.tag_bind(f"tab{i}", "<Button-1>", lambda _e, i=i: self.nb.select(i))
+            c.tag_bind(f"tab{i}", "<Enter>", lambda _e, i=i: self._tab_hover(i, True))
+            c.tag_bind(f"tab{i}", "<Leave>", lambda _e, i=i: self._tab_hover(i, False))
+            self._tab_labels.append((t, hit))
+        self._tab_rule = c.create_line(0, 35, 0, 35, fill=LINE)
+        self._tab_glow_ids = [c.create_line(0, 0, 0, 0) for _ in range(self._GLOW_ROWS)]
+        self._tab_core = c.create_rectangle(0, 0, 0, 0, outline="")
+        self._tab_x = None                    # indicator's current (x0, x1)
+        self._tab_rgb = (255, 255, 255)
+        self._tab_job = None
+        c.bind("<Configure>", lambda _e: self._tab_layout(animate=False))
+        self.nb.bind("<<NotebookTabChanged>>", lambda _e: self._tab_layout(animate=True))
+
+    def _tab_target(self):
+        """Indicator span under the selected label: label width plus a little lip."""
+        x0, _y0, x1, _y1 = self.tabbar.bbox(self._tab_labels[self.nb.index("current")][0])
+        return x0 - 4, x1 + 4
+
+    def _tab_layout(self, animate):
+        c = self.tabbar
+        w = c.winfo_width()
+        if w <= 1:
+            return
+        n, cur = len(self._tab_labels), self.nb.index("current")
+        seg = w / n                           # equal slots: nothing shifts on select
+        for i, (t, hit) in enumerate(self._tab_labels):
+            c.coords(t, seg * (i + 0.5), 15)
+            c.coords(hit, seg * i, 0, seg * (i + 1), 36)
+            c.itemconfig(t, fill=TEXT if i == cur else MUTE)
+        c.coords(self._tab_rule, 0, 35, w, 35)
+        target = self._tab_target()
+        if not animate or self._tab_x is None:
+            self._tab_x = target
+            self._tab_draw()
+        elif self._tab_job is None:
+            self._tab_slide()
+
+    def _tab_slide(self):
+        # ease toward the selected tab; re-reads the target so fast clicks just retarget
+        (a0, a1), (b0, b1) = self._tab_x, self._tab_target()
+        k = 0.35
+        self._tab_x = (a0 + (b0 - a0) * k, a1 + (b1 - a1) * k)
+        if abs(b0 - self._tab_x[0]) < 0.5 and abs(b1 - self._tab_x[1]) < 0.5:
+            self._tab_x, self._tab_job = (b0, b1), None
+        else:
+            self._tab_job = self.root.after(16, self._tab_slide)
+        self._tab_draw()
+
+    def _tab_draw(self):
+        c, (x0, x1) = self.tabbar, self._tab_x
+        c.coords(self._tab_core, x0, 33, x1, 36)
+        for r, item in enumerate(self._tab_glow_ids):    # r=0 nearest the strip
+            y = 32 - r
+            c.coords(item, x0 + r, y, x1 - r, y)          # spill narrows as it rises
+        self._tab_glow(self._tab_rgb)
+
+    def _tab_glow(self, rgb):
+        if not hasattr(self, "_tab_core"):
+            return
+        if max(rgb) < 40:                     # strip dark/off: keep the indicator visible
+            rgb = (232, 236, 244)             # TEXT
+        self._tab_rgb = rgb
+        c, ink = self.tabbar, (0x0A, 0x0C, 0x12)
+        mix = lambda f: "#%02x%02x%02x" % tuple(int(b + (x - b) * f) for x, b in zip(rgb, ink))
+        c.itemconfig(self._tab_core, fill=mix(1.0))
+        for r, item in enumerate(self._tab_glow_ids):
+            c.itemconfig(item, fill=mix(0.42 * (1 - r / self._GLOW_ROWS) ** 2))
+
+    def _tab_hover(self, i, on):
+        if i != self.nb.index("current"):
+            self.tabbar.itemconfig(self._tab_labels[i][0], fill="#B4BFD0" if on else MUTE)
+
     def set_color(self, rgb):
         self.base_color = rgb
-        self.swatch.config(bg="#%02x%02x%02x" % rgb)
+        if getattr(self.soft, "PICKS_COLOR", False):
+            self._stop_soft()                 # Rainbow etc. ignore color: the pick wins
+        if self.soft is None:              # a brightness-only effect keeps going, new color
+            self.mode = "color"
+        self._paint(rgb)
         self._apply_current_color()
+        if getattr(self, "_tray", None) is not None:   # tray dot follows the color
+            self._tray.icon = self._tray_image(rgb)
 
-    # ---- button callbacks ----
-    def on_scan(self):        self.ble.submit(self.ble._scan())
-    def on_connect(self):     self.ble.submit(self.ble._connect())
-    def on_disconnect(self):  self.ble.submit(self.ble._disconnect())
+    # ---- light strip picker ----
+    @staticmethod
+    def _saved_address():
+        try:
+            with open(ADDR_FILE) as f:
+                return f.read().strip() or None
+        except OSError:
+            return None
 
+    def _remember_strip(self, name, addr):
+        known = {s[1]: s for s in self.strips}
+        if addr not in known:
+            self.strips.append([name or "Light strip", addr])
+        elif name and known[addr][0] == "Light strip":
+            known[addr][0] = name             # a scan learned the real name
+
+    def _refresh_strips(self, select=None):
+        saved = {a for _, a in self.strips}
+        self._choices = [tuple(s) for s in self.strips] + \
+                        [f for f in self._found if f[1] not in saved]
+        labels = [f"{n}  ·  {a[-5:]}" for n, a in self._choices]
+        self.strip_cb.config(values=labels)
+        addrs = [a for _, a in self._choices]
+        if select in addrs:
+            self.strip_cb.current(addrs.index(select))
+        else:
+            self.strip_var.set("Pick your light strip" if self._choices
+                               else "No strip saved — tap ↻ to scan")
+
+    def on_strip_pick(self, _evt=None):
+        i = self.strip_cb.current()
+        if i < 0:
+            return
+        name, addr = self._choices[i]
+        self._remember_strip(name, addr)
+        self._refresh_strips(addr)
+        self._draw_link(True)
+        self.ble.submit(self.ble._select(addr))
+
+    def on_strip_scan(self):
+        self.scan_btn.config(state="disabled")
+        self.set_status("Scanning for strips...")
+        fut = self.ble.submit(self.ble._scan_all())
+        fut.add_done_callback(lambda f: self.root.after(0, self._strip_scan_done, f))
+
+    def _strip_scan_done(self, fut):
+        self.scan_btn.config(state="normal")
+        try:
+            self._found = fut.result()
+        except Exception as e:
+            self.set_status(f"Scan failed: {e}")
+            return
+        for name, addr in self._found:        # refresh names of strips we already saved
+            if any(a == addr for _, a in self.strips):
+                self._remember_strip(name, addr)
+        self._refresh_strips(self.ble.address)
+        n = len(self._found)
+        self.set_status(f"Found {n} strip{'s' * (n != 1)} — pick one above" if n
+                        else "No strips found — is it on and the phone app closed?")
+
+    def on_link_toggle(self):
+        if self.ble._want_connected:
+            self.ble.submit(self.ble._disconnect())
+            self._draw_link(False)
+        else:
+            self.ble.submit(self.ble._connect(fx=True))
+            self._draw_link(True)
+
+    def _draw_link(self, on=None):
+        """iOS-style switch: knob right = link wanted; green once actually connected."""
+        if on is None:
+            on = self.ble._want_connected
+        c = self.link_sw
+        c.delete("all")
+        track = (GOOD if self.ble._connected() else MUTE) if on else LINE
+        c.create_oval(2, 2, 22, 22, fill=track, outline="")
+        c.create_oval(22, 2, 42, 22, fill=track, outline="")
+        c.create_rectangle(12, 2, 32, 22, fill=track, outline="")
+        x = 24 if on else 4
+        c.create_oval(x, 4, x + 16, 20, fill=TEXT if on else MUTE, outline="")
+
+    # ---- color chips (presets + saved custom colors) ----
+    def _chip(self, parent, rgb, on_remove=None):
+        chip = tk.Frame(parent, bg="#%02x%02x%02x" % rgb, width=22, height=22,
+                        cursor="hand2", highlightthickness=1, highlightbackground=LINE)
+        chip.pack_propagate(False)
+        chip.pack(side="left", padx=(0, 8))
+        chip.bind("<Button-1>", lambda _e: self.set_color(rgb))
+        if on_remove:
+            chip.bind("<Button-3>", lambda _e: on_remove(rgb))
+        return chip
+
+    def _render_custom(self):
+        for w in self.custom_row.winfo_children():
+            w.destroy()
+        for rgb in self.custom:
+            self._chip(self.custom_row, rgb, on_remove=self._remove_custom)
+        if not self.custom:
+            tk.Label(self.custom_row, text="Pick color → Save to keep it here",
+                     font=FONT_BODY, fg=MUTE, bg=PANEL).pack(side="left")
+
+    def _add_custom(self, rgb):
+        self.custom = [rgb] + [c for c in self.custom if c != rgb][:CUSTOM_MAX - 1]
+        self._render_custom()
+
+    def _remove_custom(self, rgb):
+        self.custom = [c for c in self.custom if c != rgb]
+        self._render_custom()
+
+    # ---- live color picker: the strip follows the cursor while dragging ----
     def on_pick(self):
-        rgb, _ = colorchooser.askcolor(color="#%02x%02x%02x" % self.base_color,
-                                       title="Pick a color")
-        if rgb:
-            self.set_color(tuple(int(x) for x in rgb))
+        if self._picker is not None and self._picker.winfo_exists():
+            self._picker.lift()
+            return
+        W, H = 300, 180
+        orig = self.base_color
+        top = self._picker = tk.Toplevel(self.root, bg=PANEL, padx=14, pady=14)
+        top.title("Pick a color")
+        top.resizable(False, False)
+        top.transient(self.root)
+
+        img = tk.PhotoImage(width=W, height=H)
+        img.put(hs_image_data(W, H))
+        cv = tk.Canvas(top, width=W, height=H, bd=0, highlightthickness=0,
+                       cursor="crosshair", bg=PANEL)
+        cv.create_image(0, 0, anchor="nw", image=img)
+        cv.image = img                       # keep a reference or Tk drops the image
+        cv.pack()
+        ring = cv.create_oval(0, 0, 0, 0, outline="white", width=2)
+
+        def place(x, y):
+            cv.coords(ring, x - 7, y - 7, x + 7, y + 7)
+
+        h, s, _v = colorsys.rgb_to_hsv(*(c / 255.0 for c in orig))
+        place(h * (W - 1), (1 - s) * (H - 1))
+
+        def pick(e):
+            x, y = min(max(e.x, 0), W - 1), min(max(e.y, 0), H - 1)
+            place(x, y)
+            # set_color queues on the coalescing "color" slot: a fast drag sends
+            # only the newest color at the strip's real rate — live, never laggy
+            self.set_color(hs_rgb(x / (W - 1), 1 - y / (H - 1)))
+        cv.bind("<Button-1>", pick)
+        cv.bind("<B1-Motion>", pick)
+
+        def cancel():
+            self.set_color(orig)
+            top.destroy()
+
+        def save():
+            self._add_custom(self.base_color)
+            top.destroy()
+
+        row = tk.Frame(top, bg=PANEL)
+        row.pack(fill="x", pady=(12, 0))
+        self._flat(row, "Save to Custom", save, bg=GOOD, fg=INK, hover="#5FE3B4"
+                   ).pack(side="left", expand=True, fill="x", padx=(0, 5))
+        self._flat(row, "Done", top.destroy).pack(side="left", expand=True, fill="x",
+                                                 padx=(0, 5))
+        self._flat(row, "Cancel", cancel).pack(side="left", expand=True, fill="x")
+        top.protocol("WM_DELETE_WINDOW", top.destroy)   # X keeps the live color
 
     def on_brightness(self, val):
         self.brightness = int(float(val))
         self._apply_current_color()
 
     def on_effect(self):
-        v = EFFECTS[self.effect_var.get()]
-        self.send(cmd_effect(v))
+        name = self.effect_var.get()
+        self.mode = "effect"
+        if name in SOFT_EFFECTS:
+            self._start_soft(name)
+            return
+        self._stop_soft()
+        self._stop_sync()                     # sync frames would overwrite the effect
+        self._stop_audio()
+        # same "color" slot as the flame frames, so a pending one can't land after
+        # this and freeze the strip on a static color
+        self.ble.queue("color", cmd_effect(EFFECTS[name]))
+        self.set_status(f"{name} effect ON")
+
+    # ---- EFFECTS tab grid ----
+    @staticmethod
+    def _rrect(c, x0, y0, x1, y1, r, **kw):
+        """Rounded rectangle on a Tk canvas (smoothed polygon)."""
+        pts = (x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1,
+               x1 - r, y1, x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0)
+        return c.create_polygon(pts, smooth=True, **kw)
+
+    def _fx_layout(self, evt):
+        """(Re)build the tile grid for the canvas width: no-effect + app effects,
+        then the strip's built-ins grouped by kind. Labels say only the variant."""
+        if evt.width == self._fx_w:
+            return
+        self._fx_w = w = evt.width
+        c = self.fx_canvas
+        c.delete("all")
+        self._fx_tiles, self._fx_shown, self._fx_active = {}, {}, False
+        cols, gap, edge = 5, 10, 5                       # edge: room for the active ring
+        tile = (w - 2 * edge - gap * (cols - 1)) // cols
+        groups = [("In RGBZap · stops when the app closes", [(None, "None")] +
+                   [(n, n) for n in SOFT_EFFECTS])]
+        for kind in ("Jump", "Crossfade", "Blink"):
+            groups.append((f"On the strip · {kind}", [(n, n.partition(" ")[2])
+                                                      for n in EFFECTS
+                                                      if n.startswith(kind + " ")]))
+        y = 0
+        for title, items in groups:
+            c.create_text(edge, y + 8, text=title.upper(), anchor="w", fill=MUTE,
+                          font=FONT_EYE)
+            y += 24
+            for i, (name, label) in enumerate(items):
+                x0 = edge + (i % cols) * (tile + gap)
+                y0 = y + (i // cols) * (tile + 30)
+                tag = f"fx{len(self._fx_tiles)}"
+                ring = self._rrect(c, x0 - 4, y0 - 4, x0 + tile + 4, y0 + tile + 4, 12,
+                                   fill="", outline="", width=2, tags=tag)
+                glow = self._rrect(c, x0 - 2, y0 - 2, x0 + tile + 2, y0 + tile + 2, 10,
+                                   fill=PANEL, outline="", tags=tag)
+                if name is None:                 # empty square, red cross: no effect
+                    face = self._rrect(c, x0, y0, x0 + tile, y0 + tile, 8, fill=PANEL,
+                                       outline=LINE, dash=(3, 3), tags=tag)
+                    m = tile // 4
+                    for xa, xb in ((x0 + m, x0 + tile - m), (x0 + tile - m, x0 + m)):
+                        c.create_line(xa, y0 + m, xb, y0 + tile - m, fill=BAD, width=2,
+                                      capstyle="round", tags=tag)
+                else:
+                    face = self._rrect(c, x0, y0, x0 + tile, y0 + tile, 8, fill=PANEL2,
+                                       outline=LINE, tags=tag)
+                text = c.create_text(x0 + tile / 2, y0 + tile + 12, text=label, fill=MUTE,
+                                     font=("Segoe UI", 8), tags=tag)
+                self._fx_tiles[name] = (ring, glow, face, text)
+                c.tag_bind(tag, "<Button-1>", lambda _e, n=name: self.on_fx_pick(n))
+                c.tag_bind(tag, "<Enter>", lambda _e, f=face: (
+                    c.itemconfig(f, outline=MUTE), c.config(cursor="hand2")))
+                c.tag_bind(tag, "<Leave>", lambda _e, f=face: (
+                    c.itemconfig(f, outline=LINE), c.config(cursor="")))
+            y += ((len(items) + cols - 1) // cols) * (tile + 30) + 6
+        c.config(scrollregion=(0, -6, w, y))
+        self._fx_render()
+
+    def on_fx_pick(self, name):
+        if name is None:
+            self.on_effect_off()
+        else:
+            self.effect_var.set(name)
+            self.on_effect()
+        self._fx_render()
+
+    def _fx_current(self):
+        """Tile to highlight: the running effect, None for a steady color, or ""
+        (nothing) while screen sync / audio reactive owns the strip."""
+        if self.sync.running or self.audio.running:
+            return ""
+        return self.effect_var.get() if self.mode == "effect" else None
+
+    def _fx_tick(self):
+        # always ticking (cheap), but only animates while the tab is on screen
+        self.root.after(80, self._fx_tick)
+        if self.nb.select() != str(self.fx_tab) or self.root.state() != "normal":
+            return
+        speed = int(float(self.speed.get()))
+        self._fx_t += 0.08 * _sf(speed)
+        for name, prev in self._fx_prev.items():
+            out = prev.step(0.08, speed)
+            if not isinstance(out, tuple):      # level effect: shown on the user's color
+                out = tuple(int(c * out) for c in self.base_color)
+            self._fx_paint(name, out)
+        for name in EFFECTS:
+            self._fx_paint(name, builtin_preview(name, self._fx_t))
+        self._fx_render()
+
+    def _fx_paint(self, name, rgb):
+        items = self._fx_tiles.get(name)
+        if items is None or self._fx_shown.get(name) == rgb:
+            return
+        self._fx_shown[name] = rgb
+        _ring, glow, face, _text = items
+        bg = (0x12, 0x15, 0x1E)                         # PANEL: the glow bleeds into it
+        bleed = tuple(int(b + (c - b) * 0.35) for c, b in zip(rgb, bg))
+        self.fx_canvas.itemconfig(face, fill="#%02x%02x%02x" % rgb)
+        self.fx_canvas.itemconfig(glow, fill="#%02x%02x%02x" % bleed)
+
+    def _fx_render(self):
+        """Move the highlight ring + bright label to the active tile."""
+        cur = self._fx_current()
+        if cur == self._fx_active or not self._fx_tiles:
+            return
+        c = self.fx_canvas
+        old = self._fx_tiles.get(self._fx_active)
+        if old:
+            c.itemconfig(old[0], outline="")
+            c.itemconfig(old[3], fill=MUTE, font=("Segoe UI", 8))
+        new = self._fx_tiles.get(cur)
+        if new:
+            c.itemconfig(new[0], outline=TEXT)
+            c.itemconfig(new[3], fill=TEXT, font=("Segoe UI Semibold", 8))
+        self._fx_active = cur
+
+    # ---- scenes ----
+    def _scene_snapshot(self):
+        return {"color": list(self.base_color), "brightness": self.brightness,
+                "mode": self.mode, "effect": self.effect_var.get(),
+                "speed": int(float(self.speed.get()))}
+
+    def _refresh_scenes(self):
+        self.scene_cb.config(values=list(self.scenes))
+
+    def apply_scene(self, name):
+        sc = self.scenes.get(name)
+        if sc is None:
+            return
+        self._stop_sync()                     # a scene owns the strip, like an effect
+        self._stop_soft()
+        self._stop_audio()
+        self.effect_var.set(sc["effect"])
+        self.bright.set(sc["brightness"])     # fires on_brightness
+        self.speed.set(sc["speed"])
+        self.set_color(tuple(sc["color"]))
+        if sc["mode"] == "effect":
+            self.on_effect()
+        else:
+            self.on_effect_off()
+        self.scene_var.set(name)
+        self.set_status(f"Scene: {name}")
+
+    def on_scene_save(self):
+        current = self.scene_var.get()
+        name = simpledialog.askstring(
+            "Save scene", "Name for the current color, brightness and effect:",
+            initialvalue=current if current in self.scenes else "", parent=self.root)
+        name = (name or "").strip()[:40]
+        if not name:
+            return
+        existed = name in self.scenes
+        self.scenes[name] = self._scene_snapshot()
+        self._refresh_scenes()
+        self.scene_var.set(name)
+        self.set_status(f"Scene {'updated' if existed else 'saved'}: {name}")
+
+    def on_scene_delete(self):
+        name = self.scene_var.get()
+        if name not in self.scenes:
+            self.set_status("Pick a scene to delete first")
+            return
+        if not messagebox.askyesno("Delete scene", f"Delete the scene \"{name}\"?",
+                                   parent=self.root):
+            return
+        del self.scenes[name]
+        self._refresh_scenes()
+        self.scene_var.set("")
+        self.set_status(f"Scene deleted: {name}")
+
+    def on_effect_off(self):
+        """Stop any effect (flame or built-in) and go back to the steady color."""
+        self._stop_soft()
+        self._stop_audio()
+        self.mode = "color"
+        self._apply_current_color()          # a color frame ends built-in effects too
+        self.set_status("Effect off")
+
+    def on_off(self):
+        self._stop_soft()
+        self._stop_sync()
+        self._stop_audio()
+        self.ble.queue("color", cmd_off())
+
+    # ---- software effects (SOFT_EFFECTS: flames, Breathe, Rainbow, ...) ----
+    def _start_soft(self, name):
+        self._stop_sync()
+        self._stop_audio()
+        self.send(cmd_on())
+        self.soft = SOFT_EFFECTS[name]()
+        self.set_status(f"{name} effect ON")
+        if self._soft_job is None:
+            self._soft_tick()
+
+    def _stop_soft(self):
+        if self.soft is not None:
+            self._paint(self.base_color)      # a color-picking effect left the UI tinted
+        self.soft = None
+        if self._soft_job is not None:
+            self.root.after_cancel(self._soft_job)
+            self._soft_job = None
+
+    def _soft_tick(self):
+        # Tk thread: reads sliders safely; the writer paces/coalesces to the strip
+        out = self.soft.step(SEND_INTERVAL, int(float(self.speed.get())))
+        s = self.brightness / 100.0
+        if isinstance(out, tuple):            # effect picks the color: show it live
+            r, g, b = out
+            self._paint(out)
+        else:                                 # brightness-only effect on the user's color
+            r, g, b = self.base_color
+            s *= out
+        self.ble.queue("color", cmd_color(int(r * s), int(g * s), int(b * s)))
+        self._soft_job = self.root.after(int(SEND_INTERVAL * 1000), self._soft_tick)
 
     def on_speed(self, val):
         self.ble.queue("speed", cmd_effect_speed(int(float(val))))
 
     # ---- screen sync callbacks ----
     def set_sync_swatch(self, rgb):
-        # show the live synced color in the swatch (thread-safe)
-        self.root.after(0, lambda: self.swatch.config(bg="#%02x%02x%02x" % rgb))
+        # show the live synced color across the UI (thread-safe)
+        self.root.after(0, lambda: self._paint(rgb))
 
     def on_display_change(self, _evt=None):
         if not self._monitors:
@@ -607,12 +2297,18 @@ class App:
 
     def on_style_change(self, _evt=None):
         self.sync.style = self.style_var.get()
+        # adopt the style's default saturation and reflect it on the slider
+        self.sync.sat = SYNC_STYLES[self.sync.style][0]
+        self.sat_scale.set(int(self.sync.sat * 100))
         if self.sync.running:
             self.set_status(f"Screen Sync ON — {self.sync.style}")
 
     def on_smooth(self, val):
         # slider 5..100 -> alpha 0.05..1.0 (higher = snappier, lower = smoother)
         self.sync.alpha = max(0.05, int(float(val)) / 100.0)
+
+    def on_sat(self, val):
+        self.sync.sat = int(float(val)) / 100.0
 
     def on_startup_toggle(self):
         want = self.startup_var.get()
@@ -622,29 +2318,528 @@ class App:
             self.startup_var.set(not want)  # revert the checkbox on failure
             self.set_status("Couldn't change startup setting")
 
+    # ---- notification / call alerts ----
+    def on_notify_toggle(self):
+        self.notify_flash, self.notify_call = self.flash_var.get(), self.call_var.get()
+        if UserNotificationListener is None:
+            return
+        if self.notify_flash or self.notify_call:
+            self.notifier.start()
+        else:
+            self.notifier.stop()
+
+    def _on_notification(self, call):
+        # watcher thread: only reads plain bools and hands work to the BLE loop
+        if call and self.notify_call:
+            self.ble.submit(self.ble._alert("call", self.brightness))
+        elif not call and self.notify_flash:
+            self.ble.submit(self.ble._alert("notify", self.brightness))
+
+    def on_alert_test(self, kind):
+        if not self.ble._connected():
+            self.set_status("Connect a light strip first")
+            return
+        self.set_status("Test call — pulsing for 4 s" if kind == "call"
+                        else "Test notification")
+        self.ble.submit(self.ble._alert(kind, self.brightness, max_s=4.0))
+
     def on_toggle_sync(self):
         if self.sync.running:
-            self.sync.stop()
-            self.sync_btn.config(text="▶ Start Screen Sync", bg="#1565c0")
+            self._stop_sync()
         else:
             if not self._monitors:
                 self.set_status("No display detected for sync")
                 return
+            self._stop_soft()
+            self._stop_audio()
             self.send(cmd_on())          # make sure the strip is on
             self.sync.start()
-            self.sync_btn.config(text="■ Stop Screen Sync", bg="#c62828")
+            self.sync_btn.config(text="■  Stop screen sync", bg=BAD, fg=INK,
+                                 activebackground="#FF8080")
+
+    # ---- audio reactive ----
+    def _audio_set(self, attr, value):
+        setattr(self.audio, attr, value)      # read live by the capture thread
+        if attr == "source" and self.audio.running:   # new device: reopen capture
+            self.audio.stop()
+            self.root.after(300, self._start_audio)
+
+    def on_audio_mode(self, _evt=None):
+        mode = self.audio_mode_var.get()
+        self.audio.mode = mode
+        self.audio._reset()                   # fresh envelope/hue for the new mode
+        self.audio_desc.config(text=AUDIO_MODES[mode])
+        if self.audio.running:
+            self.set_status(f"Audio reactive ON — {mode}")
+
+    def on_toggle_audio(self):
+        if self.audio.running:
+            self._stop_audio()
+        else:
+            self._start_audio()
+
+    def _start_audio(self):
+        if self.audio.running:
+            return
+        self._stop_sync()
+        self._stop_soft()
+        self.send(cmd_on())
+        self.audio.start()
+        self.audio_btn.config(text="■  Stop audio reactive", bg=BAD, fg=INK,
+                              activebackground="#FF8080")
+        self._meter_tick()
+
+    def _stop_audio(self):
+        if self.audio.running:
+            self.audio.stop()                 # thread ends -> _audio_stopped resets UI
+
+    def _audio_stopped(self):
+        """Tk thread, after capture ends (stopped or failed): reset button + meter."""
+        self.audio_btn.config(text="▶  Start audio reactive", bg=AUDIO_PINK, fg="white",
+                              activebackground="#E86AB1")
+        self._paint(self.base_color)
+        self._draw_meter()
+        if self.soft is None and not self.sync.running:
+            self._apply_current_color()       # settle on the steady color, not a mid-beat frame
+
+    def _meter_tick(self):
+        self._draw_meter()
+        if self.audio.running:
+            self.root.after(50, self._meter_tick)
+
+    def _draw_meter(self):
+        c = self.meter
+        w = max(c.winfo_width(), 200)
+        f = self.audio.feat if self.audio.running else None
+        span = w - 52 - 80                    # bars leave room for beat light + swatch
+        for i, key in enumerate(("bass", "mid", "high")):
+            y = 12 + i * 20
+            v = f[key] if f else 0.0
+            c.coords(self._meter_bars[key], 52, y, 52 + span * v, y + 10)
+        for item in c.find_withtag("track"):
+            x0, y0, _x1, y1 = c.coords(item)
+            c.coords(item, x0, y0, 52 + span, y1)
+        hot = f is not None and time.perf_counter() - self.audio.last_beat < 0.12
+        c.coords(self._meter_beat, w - 66, 26, w - 50, 42)
+        c.itemconfig(self._meter_beat, fill=AUDIO_PINK if hot else PANEL)
+        rgb, lvl = self.audio.out_rgb if f else ((0, 0, 0), 0.0)
+        c.coords(self._meter_out, w - 38, 10, w - 10, 64)
+        c.itemconfig(self._meter_out, fill="#%02x%02x%02x" % tuple(int(x * lvl) for x in rgb))
+
+    def _stop_sync(self):
+        if self.sync.running:
+            self.sync.stop()
+            self.sync_btn.config(text="▶  Start screen sync", bg=SYNC_BLUE, fg="white",
+                                 activebackground="#5A97F8")
+
+    # ---- system tray: closing the window hides it here; Quit really exits ----
+    _tray_bolt = None
+
+    @classmethod
+    def _tray_image(cls, rgb):
+        """64px tray icon: the RGBZap bolt with a badge in the strip's live color."""
+        if cls._tray_bolt is None:
+            try:
+                cls._tray_bolt = Image.open(os.path.join(ASSETS, "icon.png")).convert(
+                    "RGBA").resize((64, 64), Image.LANCZOS)
+            except OSError:
+                cls._tray_bolt = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        img = cls._tray_bolt.copy()
+        d = ImageDraw.Draw(img)
+        d.ellipse((38, 38, 63, 63), fill=INK)
+        d.ellipse((42, 42, 59, 59), fill=tuple(rgb))
+        return img
+
+    def _start_tray(self):
+        if pystray is None:
+            return
+        Item, Menu = pystray.MenuItem, pystray.Menu
+
+        def act(fn):
+            # pystray calls from its own thread; Tk must only be touched on the main one
+            return lambda _icon, _item: self.root.after(0, fn)
+
+        def colors():
+            named = [Item(name, act(lambda c=rgb: self.set_color(c))) for name, rgb in PRESETS]
+            mine = [Item("#%02X%02X%02X" % c, act(lambda c=c: self.set_color(c)))
+                    for c in self.custom]
+            return mine + ([Menu.SEPARATOR] if mine else []) + named
+
+        def scenes():
+            return ([Item(n, act(lambda n=n: self.apply_scene(n))) for n in self.scenes]
+                    or [Item("No scenes yet", None, enabled=False)])
+
+        def pick_effect(name):
+            self.effect_var.set(name)
+            self.on_effect()
+
+        effects = [Item(n, act(lambda n=n: pick_effect(n))) for n in SOFT_EFFECTS]
+        effects += [Menu.SEPARATOR] + [Item(n, act(lambda n=n: pick_effect(n)))
+                                       for n in EFFECTS]
+        effects += [Menu.SEPARATOR, Item("Effect off", act(self.on_effect_off))]
+        bright = [Item(f"{v}%", act(lambda v=v: self.bright.set(v)),
+                       checked=lambda _i, v=v: self.brightness == v, radio=True)
+                  for v in (100, 75, 50, 25, 10)]
+
+        menu = Menu(
+            Item("Show RGBZap", act(self.show_window), default=True),   # left-click
+            Menu.SEPARATOR,
+            Item("Turn on", act(lambda: self.send(cmd_on()))),
+            Item("Turn off", act(self.on_off)),
+            Item("Scenes", Menu(scenes)),                 # rebuilt on open: saves show at once
+            Item("Colors", Menu(colors)),                 # rebuilt on open: custom stays current
+            Item("Brightness", Menu(*bright)),
+            Item("Effects", Menu(*effects)),
+            Item("Screen sync", act(self.on_toggle_sync),
+                 checked=lambda _i: self.sync.running),
+            Item("Audio reactive", act(self.on_toggle_audio),
+                 checked=lambda _i: self.audio.running),
+            Menu.SEPARATOR,
+            Item("Quit RGBZap", act(self.quit)),
+        )
+        self._tray = pystray.Icon("RGBZap", self._tray_image(self.base_color),
+                                  "RGBZap — LED Console", menu)
+        self._tray.run_detached()
+
+    def show_window(self):
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+    def hide_to_tray(self):
+        if self._tray is None:
+            self.quit()                       # no tray available: X quits as before
+            return
+        self.root.withdraw()
+        if not self._tray_hint_shown:         # tell them once per run where it went
+            self._tray_hint_shown = True
+            try:
+                self._tray.notify("RGBZap is still running here. Right-click for options, "
+                                  "or Quit RGBZap to exit.", "RGBZap")
+            except Exception:
+                pass
+
+    def _listen_for_second_launch(self, lock):
+        """A second launch connects to our lock port instead of starting: show the
+        window, since it may be hidden in the tray."""
+        def run():
+            while True:
+                try:
+                    conn, _ = lock.accept()
+                    conn.close()
+                    self.root.after(0, self.show_window)
+                except OSError:
+                    return
+        threading.Thread(target=run, daemon=True).start()
+
+    def quit(self):
+        if self._tray is not None:
+            self._tray.visible = False        # stop() alone leaves a ghost icon on Windows
+            self._tray.stop()
+        self.on_close()
 
     def on_close(self):
+        # Block until the BLE disconnect actually completes before tearing down.
+        # The worker thread is a daemon, so if we destroy the window and exit while
+        # the disconnect is still in flight, the strip is left in a ghost connection
+        # and stops advertising — the "have to unplug it to reconnect" bug.
+        self.sync.stop()
+        self.audio.stop()
+        self._stop_soft()                    # no tick may fire into a destroyed window
+        self._save()
+        self.set_status("Disconnecting...")
         try:
-            self.sync.stop()
-            self.ble.submit(self.ble._disconnect())
-        finally:
-            self.root.after(200, self.root.destroy)
+            fut = self.ble.submit(self.ble._disconnect())
+            fut.result(timeout=4.0)   # wait for a clean GATT disconnect
+        except Exception:
+            pass                      # never block the close on an error/timeout
+        self.root.destroy()
+
+
+def _selftest():
+    """Prove the Dominant (saturation-weighted) extractor pops a small colored
+    subject that a flat Average washes out. Run: python elk_gui.py --selftest"""
+    # black BGRA frame with a small red patch (R=255 -> B=0,G=0,R=255)
+    frame = np.zeros((200, 320, 4), dtype=np.uint8)
+    frame[..., 3] = 255
+    frame[80:120, 140:180, 2] = 255  # red patch, ~2.5% of the frame
+
+    s = ScreenSync(None, lambda *_: None, lambda *_: None, lambda: 100)
+    s.dark_mode, s.sat, s.style = "Keep", 1.0, "Accurate"
+
+    s.extract_mode, s._prev = "Dominant", None
+    dr, dg, db, _ = s._extract(frame)
+    s.extract_mode, s._prev = "Average", None
+    ar, ag, ab, _ = s._extract(frame)
+
+    assert dr > dg and dr > db, f"Dominant should be red-ish, got {(dr, dg, db)}"
+    assert dr > ar + 40, f"Dominant red ({dr}) should beat Average red ({ar})"
+    assert ar < 30, f"Average of a mostly-black frame should be dark, got {ar}"
+    print(f"OK  Dominant={(dr, dg, db)}  Average={(ar, ag, ab)}")
+
+    # connect-ripple envelope: starts dark, settles bright, stays in range, bounces
+    samples = [ripple_envelope(i / 60) for i in range(61)]
+    assert all(0.0 <= v <= 1.0 for v in samples), "envelope out of [0,1]"
+    assert samples[0] < 0.05, f"ripple should start dark, got {samples[0]:.3f}"
+    assert samples[-1] > 0.9, f"ripple should settle bright, got {samples[-1]:.3f}"
+    peak = max(range(61), key=lambda i: samples[i])
+    assert any(samples[j] < samples[j - 1] for j in range(peak + 1, 61)), \
+        "ripple should dip after its first peak (a bounce, not a plain fade)"
+    print("OK  ripple envelope: dark-start, bounce, bright-settle")
+
+    # settings: round-trip, and bad values fall back to defaults instead of crashing
+    import tempfile
+    p = os.path.join(tempfile.mkdtemp(), "s.json")
+    good = dict(DEFAULT_SETTINGS, color=[10, 20, 30], brightness=40, mode="effect",
+                effect="Blink Red", style="Vivid", sat=200)
+    save_settings(good, p)
+    assert load_settings(p) == good, "settings round-trip failed"
+    with open(p, "w") as f:
+        json.dump({"color": [300, 0, 0], "brightness": 0, "effect": "Nope",
+                   "speed": True, "sat": "x", "smooth": 60}, f)
+    got = load_settings(p)
+    assert got == dict(DEFAULT_SETTINGS, smooth=60), f"bad values not rejected: {got}"
+    with open(p, "w") as f:
+        f.write("{not json")
+    assert load_settings(p) == DEFAULT_SETTINGS, "corrupt file should give defaults"
+    with open(p, "w") as f:
+        json.dump({"custom": [[1, 2, 3], [999, 0, 0], "x", [4, 5, 6]] + [[7, 7, 7]] * 20}, f)
+    got = load_settings(p)["custom"]
+    assert got[:2] == [[1, 2, 3], [4, 5, 6]] and len(got) == CUSTOM_MAX, got
+    with open(p, "w") as f:
+        json.dump({"strips": [["Desk", "AA:BB"], ["", "CC"], ["x"], 5, ["Bed", "DD:EE"]]}, f)
+    assert load_settings(p)["strips"] == [["Desk", "AA:BB"], ["Bed", "DD:EE"]], "strips"
+    print("OK  settings round-trip + validation + corrupt fallback + custom colors")
+
+    # picker: the drawn field and the click mapping agree pixel-for-pixel
+    W, H = 300, 180
+    rows = [r.strip("{}").split() for r in hs_image_data(W, H).split("} {")]
+    assert len(rows) == H and all(len(r) == W for r in rows), "picker image size"
+    for x, y in [(0, 0), (W - 1, 0), (W // 3, H // 2), (W - 1, H - 1), (123, 45)]:
+        want = hs_rgb(x / (W - 1), 1 - y / (H - 1))
+        got = tuple(int(rows[y][x][i:i + 2], 16) for i in (1, 3, 5))
+        assert all(abs(a - b) <= 1 for a, b in zip(want, got)), f"({x},{y}) {want}!={got}"
+    assert hs_rgb(0, 1) == (255, 0, 0) and hs_rgb(0.5, 0) == (255, 255, 255)
+    print("OK  picker field matches click mapping (red top-left, white bottom)")
+
+    # flames: stay in [floor, 1], move smoothly, keep moving; Fire wilder than Candle
+    import random
+    spans = {}
+    for name, params in FLAME_EFFECTS.items():
+        f = Flame(*params, rng=random.Random(1))
+        lv = [f.step(SEND_INTERVAL, 50) for _ in range(1500)]   # ~2 min of ticks
+        assert all(params[0] - 1e-9 <= v <= 1.0 for v in lv), f"{name} out of range"
+        jump = max(abs(a - b) for a, b in zip(lv, lv[1:]))
+        assert jump < 0.4, f"{name} jumps {jump:.2f} in one tick (not smooth)"
+        assert len({round(v, 4) for v in lv}) > 300, f"{name} barely changes"
+        spans[name] = float(np.std(lv))
+    assert spans["Candle"] < spans["Torch"] < spans["Fire"], f"intensity order {spans}"
+    print("OK  flames in range, smooth, alive, Candle<Torch<Fire " +
+          str({k: round(v, 3) for k, v in spans.items()}))
+
+    # every software effect: valid output for ~2 min at slow/normal/fast speed
+    def ok_out(o):
+        if isinstance(o, tuple):
+            return len(o) == 3 and all(type(c) is int and 0 <= c <= 255 for c in o)
+        return 0.0 <= o <= 1.0
+    for name, make in SOFT_EFFECTS.items():
+        for sp in (1, 50, 100):
+            fx = make()
+            if hasattr(fx, "rng"):
+                fx.rng = random.Random(3)
+            outs = [fx.step(SEND_INTERVAL, sp) for _ in range(1500)]
+            assert all(ok_out(o) for o in outs), f"{name}@{sp} bad output"
+            assert len(set(outs)) > 1, f"{name}@{sp} never changes"
+    b = Breathe()
+    lv = [b.step(SEND_INTERVAL, 50) for _ in range(150)]            # 12 s = 2 breaths
+    assert max(lv) > 0.95 and min(lv) < 0.15, "Breathe should swing dim <-> full"
+    h = Heartbeat()
+    lv = [h.step(SEND_INTERVAL, 50) for _ in range(125)]            # 10 s at 60 bpm
+    peaks = sum(1 for a, c, d in zip(lv, lv[1:], lv[2:]) if c > a and c >= d and c > 0.6)
+    assert 15 <= peaks <= 25, f"Heartbeat should double-pulse ~10x in 10 s, got {peaks}"
+    lt = Lightning(rng=random.Random(5))
+    outs = [lt.step(SEND_INTERVAL, 50) for _ in range(1500)]
+    assert any(o[0] > 200 for o in outs) and outs.count(Lightning.SKY) > 1000, \
+        "Lightning should be mostly dark sky with some bright strikes"
+    rb = Rainbow()
+    hues = {round(colorsys.rgb_to_hsv(*(c / 255 for c in rb.step(SEND_INTERVAL, 50)))[0], 1)
+            for _ in range(400)}                                   # 32 s ~ one lap
+    assert len(hues) >= 9, f"Rainbow should cover the wheel, saw {sorted(hues)}"
+    print("OK  software effects: valid output at all speeds; breathe/heartbeat/lightning/"
+          "rainbow behave")
+
+    # EFFECTS tab previews: every built-in animates with valid colors, in its own hues
+    for name in EFFECTS:
+        outs = [builtin_preview(name, i * 0.08) for i in range(150)]
+        assert all(ok_out(o) for o in outs), f"{name} preview bad color"
+        assert len(set(outs)) > 1, f"{name} preview never changes"
+    assert (0, 0, 0) in {builtin_preview("Blink Red", i * 0.08) for i in range(30)}
+    assert {builtin_preview("Jump RGB", i * 0.08) for i in range(40)} == \
+        {(255, 0, 0), (0, 255, 0), (0, 0, 255)}, "Jump RGB should hit exactly R, G, B"
+    print("OK  effect previews: all built-ins animate with valid colors")
+
+    # alerts: call wording detected, ordinary messages not; frames valid; notify ends
+    for txt in ("Phone Link Incoming call Mom", "WhatsApp Incoming voice call",
+                "Teams Alex is calling you", "Discord Ringing...", "Call from +94 77 123"):
+        assert is_call(txt), f"missed call: {txt!r}"
+    for txt in ("WhatsApp Mom: call me later", "Outlook Meeting recap", "", None):
+        assert not is_call(txt), f"false call: {txt!r}"
+    nf = [alert_frame("notify", i * SEND_INTERVAL) for i in range(20)]
+    assert nf[-1] is None and all(ok_out(f) for f in nf if f), "notify frames"
+    assert sum(1 for a, b, c in zip(nf, nf[1:], nf[2:]) if a and b and c
+               and b[0] > a[0] and b[0] >= c[0]) == 2, "notify should pulse twice"
+    cf = [alert_frame("call", i * SEND_INTERVAL) for i in range(100)]
+    assert all(ok_out(f) and f[1] >= f[0] for f in cf), "call frames should be green"
+    print("OK  alerts: call detection, two-pulse notify, green call swell")
+
+    # scenes: starters valid; a bad scene is dropped, good ones kept
+    assert all(all(_valid_setting(f, sc[f]) for f in SCENE_FIELDS)
+               for sc in DEFAULT_SETTINGS["scenes"].values()), "a starter scene is invalid"
+    good_sc = {"color": [1, 2, 3], "brightness": 50, "mode": "effect", "effect": "Rainbow",
+               "speed": 70}
+    with open(p, "w") as f:
+        json.dump({"scenes": {"Mine": good_sc, "Bad": dict(good_sc, effect="Nope"),
+                              "": good_sc, "Junk": 5}}, f)
+    assert load_settings(p)["scenes"] == {"Mine": good_sc}, "scene validation"
+    with open(p, "w") as f:
+        json.dump({"scenes": {}}, f)
+    assert load_settings(p)["scenes"] == {}, "deleting every scene must stick"
+    print("OK  scenes: starters valid, bad scenes dropped, empty list kept")
+
+    # audio: band split, silence, beat detection, and every mode's output (synthetic signals)
+    RATE, BLK = 48000, 1024
+
+    def analyse(sig, sens=50):
+        an, ring, feats = AudioAnalyzer(RATE), np.zeros(2048, np.float32), []
+        for i in range(0, len(sig) - BLK + 1, BLK):
+            ring = np.concatenate([ring, sig[i:i + BLK]])[-2048:]
+            feats.append(an.feed(ring, BLK / RATE, sens))
+        return feats
+    tt = np.arange(RATE * 3) / RATE
+    bass = analyse((0.5 * np.sin(2 * np.pi * 60 * tt)).astype(np.float32))[-1]
+    treble = analyse((0.5 * np.sin(2 * np.pi * 4000 * tt)).astype(np.float32))[-1]
+    quiet = analyse(np.zeros(RATE, np.float32))[-1]
+    assert bass["bass"] > 0.8 and bass["bass"] > 3 * max(bass["mid"], bass["high"]), bass
+    assert treble["high"] > 0.8 and treble["high"] > 3 * max(treble["bass"], treble["mid"]), treble
+    assert quiet["silent"] and quiet["bass"] == quiet["level"] == 0.0, quiet
+    assert bass["centroid"] < 300 < 3000 < treble["centroid"], "centroid should track pitch"
+
+    # 120 bpm kick (60 Hz thump decaying ~80 ms) over soft hiss, 8 s -> ~16 beats
+    t8 = np.arange(RATE * 8) / RATE
+    kick = np.sin(2 * np.pi * 60 * t8) * np.exp(-(t8 % 0.5) / 0.08)
+    hiss = 0.02 * np.random.default_rng(0).standard_normal(len(t8))
+    feats = analyse((0.6 * kick + hiss).astype(np.float32))
+    beats = sum(f["beat"] for f in feats)
+    assert 13 <= beats <= 17, f"expected ~16 beats at 120 bpm in 8 s, got {beats}"
+
+    ar = AudioReactive(None, None, None, lambda: 100, lambda: (255, 120, 0), None)
+    for mode in AUDIO_MODES:
+        ar.mode = mode
+        ar._reset()
+        outs = [ar.render(f, BLK / RATE) for f in feats]
+        assert all(len(rgb) == 3 and all(0 <= c <= 255 for c in rgb) and 0 <= lv <= 1
+                   for rgb, lv in outs), f"{mode} bad output"
+        lv = [o[1] for o in outs]
+        assert max(lv) - min(lv) > 0.3, f"{mode} should move with the music"
+        assert min(lv) >= ar.floor / 100 - 1e-9, f"{mode} dropped under Min glow"
+    ar.mode = "Beat colors"
+    ar._reset()
+    hues = {ar.render(f, BLK / RATE)[0] for f in feats}
+    assert len(hues) >= 8, "Beat colors should change color on beats"
+    print(f"OK  audio: bands, silence, {beats} beats at 120 bpm, all 5 modes react")
+
+    # BLE: concurrent connects must yield ONE client; a dropped link reconnects on write
+    class _Ch:
+        uuid, properties = "0000fff3-0000-1000-8000-00805f9b34fb", ["write-without-response"]
+
+    class _Svc:
+        characteristics = [_Ch()]
+
+    class FakeClient:
+        made = 0
+        def __init__(self, target, timeout=0, disconnected_callback=None):
+            FakeClient.made += 1
+            self.target = target
+            self.is_connected, self.services, self.writes = False, [_Svc()], 0
+        async def connect(self):
+            await asyncio.sleep(0.05)
+            self.is_connected = True
+        async def disconnect(self):
+            self.is_connected = False
+        async def write_gatt_char(self, uuid, data, response=False):
+            self.writes += 1
+            FakeClient.log.append(bytes(data))
+        log = []
+
+    global BleakClient, ADDR_FILE
+    real, BleakClient = BleakClient, FakeClient
+    real_addr_file, ADDR_FILE = ADDR_FILE, os.path.join(os.path.dirname(p), "addr.txt")
+    try:
+        w = BleWorker(lambda *_: None, lambda *_: None)
+        w.address = "AA:BB:CC:DD:EE:FF"
+
+        async def burst():
+            await asyncio.gather(*(w._connect() for _ in range(5)))
+        w.submit(burst()).result(timeout=5)
+        assert FakeClient.made == 1, f"{FakeClient.made} clients for 5 concurrent connects"
+        w.client.is_connected = False                     # strip drops the link
+        w.submit(w._write(b"x")).result(timeout=5)
+        assert FakeClient.made == 2 and w.client.writes == 1, "no reconnect on write"
+        w.submit(w._disconnect()).result(timeout=5)
+        w.submit(w._write(b"x")).result(timeout=5)
+        assert FakeClient.made == 2, "wrote after user disconnect (should stay off)"
+
+        # picking a strip in the LIGHT tab: switches the one client, saves the address
+        w.submit(w._select("11:22:33:44:55:66")).result(timeout=5)
+        old = w.client
+        assert w._connected() and old.target == "11:22:33:44:55:66", "select didn't connect"
+        w.submit(w._select("AA:BB:CC:DD:EE:FF")).result(timeout=5)
+        assert not old.is_connected and w.client.target == "AA:BB:CC:DD:EE:FF", \
+            "switching strips must release the old one"
+        made = FakeClient.made
+        w.submit(w._select("AA:BB:CC:DD:EE:FF")).result(timeout=5)
+        assert FakeClient.made == made, "re-picking the connected strip must not reconnect"
+        assert open(ADDR_FILE).read() == "AA:BB:CC:DD:EE:FF", "picked strip not saved"
+
+        # alert: plays over the current state, holds sync frames, then restores both
+        steady, sync_frame = cmd_color(1, 2, 3), cmd_color(9, 9, 9)
+
+        async def alert_mid_sync():
+            await w._write(steady)
+            task = asyncio.ensure_future(w._alert("notify", 100))
+            await asyncio.sleep(0.3)
+            w._set_pending("color", sync_frame)   # a sync frame arrives mid-alert
+            assert w._held and "color" not in w._pending, "frame not held during alert"
+            await task
+            await asyncio.sleep(0.4)              # writer sends the held frame
+        FakeClient.log.clear()
+        w.submit(alert_mid_sync()).result(timeout=10)
+        log = FakeClient.log
+        flashes = [p for p in log if p not in (steady, sync_frame, cmd_on())]
+        assert len(flashes) >= 10, "alert frames not played"
+        last_flash = max(i for i, p in enumerate(log) if p in flashes)
+        assert steady in log[last_flash:] and log[-1] == sync_frame, \
+            "after the alert: restore the steady color, then the held sync frame"
+        assert not w._alert_on and not w._held, "alert state left behind"
+    finally:
+        BleakClient, ADDR_FILE = real, real_addr_file
+    print("OK  BLE: single client under concurrent connects, reconnect, honours disconnect,"
+          " strip switching, alert restore")
 
 
 if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        _selftest()
+        raise SystemExit(0)
+
     _lock = acquire_single_instance_lock()
     if _lock is None:
+        # Already running (maybe hidden in the tray): ask it to show its window.
+        try:
+            socket.create_connection(("127.0.0.1", LOCK_PORT), timeout=2).close()
+            raise SystemExit(0)
+        except OSError:
+            pass
         # hidden root just to show the dialog
         _r = tk.Tk()
         _r.withdraw()
@@ -656,6 +2851,10 @@ if __name__ == "__main__":
         _r.destroy()
         raise SystemExit(0)
 
+    if sys.platform == "win32":
+        # own taskbar identity, so the RGBZap icon shows instead of python's
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("RGBZap.LEDConsole")
     root = tk.Tk()
-    App(root)
+    App(root, lock=_lock)
     root.mainloop()
