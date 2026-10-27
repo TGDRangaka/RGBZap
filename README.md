@@ -32,7 +32,9 @@ Bluetooth LE.
   pulse while a call rings (Phone Link, Teams, WhatsApp, Discord…), then the strip goes
   back to exactly what it was doing.
 - **Multiple strips** — scan, pick yours from a list, and RGBZap remembers it. Connects
-  automatically on launch and reconnects by itself if the link drops.
+  automatically on launch and reconnects by itself if the link drops. Strip not listed?
+  Tick **Show all Bluetooth devices** and pick it from there.
+- **Update notices** — a banner tells you when a new version is out (optional, see Privacy).
 - **Lives in the tray** — close the window and it keeps running; right-click the tray icon
   for colors, scenes, and effects. Optional start with Windows.
 
@@ -78,6 +80,11 @@ python elk_control.py on
 3. Open RGBZap. It finds your strip, connects, and remembers it. Got more than one? Tap
    **↻** on the Light tab and pick from the list.
 
+## Updating
+Versions from 1.0.1 on show a banner when a new release is out. Click it, download the new
+`RGBZap-Setup-<version>.exe` and run it — it upgrades in place and keeps your settings.
+(1.0.0 has no update check, so install 1.0.1 or newer by hand once.)
+
 ## Requirements
 - Windows 10 or 11
 - Bluetooth LE (built in on most laptops; a cheap USB BLE dongle works on desktops)
@@ -93,8 +100,12 @@ variants) use a different byte order — the app connects but colors may look of
 strip connects but misbehaves, open an issue with its advertised name.
 
 ## Privacy
-Everything stays on your PC. RGBZap has no account, no telemetry, and makes no internet
-connections. Notification alerts are **off by default**; when you turn them on, RGBZap
+Everything stays on your PC. RGBZap has no account and no telemetry. The only internet
+request it makes is an **update check**: about once a day it asks GitHub whether a newer
+release exists, sending just a standard web request (the app name and version). It never
+downloads or installs anything by itself — if there's a new version you get a banner and
+download it yourself. Turn it off any time in **System › Updates**. Notification alerts
+are **off by default**; when you turn them on, RGBZap
 reads new notifications on your PC only to tell whether one arrived or a call is ringing —
 nothing is stored or sent anywhere.
 

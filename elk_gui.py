@@ -31,6 +31,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import urllib.request
 import webbrowser
 from tkinter import messagebox, simpledialog, ttk
 
@@ -64,7 +65,7 @@ ADDR_FILE = data_file("address.txt", legacy=os.path.join(_HERE, "elk_address.txt
 # logo / icons; inside the built exe they're unpacked under sys._MEIPASS
 ASSETS = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))),
                       "assets")
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 APP_URL = "https://github.com/TGDRangaka/RGBZap"
 AUTHOR_URL = "https://dilshan-rangaka.vercel.app/"
 LOCK_PORT = 49731  # arbitrary localhost port used as a single-instance lock
@@ -326,6 +327,7 @@ DEFAULT_SETTINGS = {
     "custom": [],                       # saved picker colors, newest first
     "strips": [],                       # user's light strips: [[name, address], ...]
     "notify_flash": False, "notify_call": False,   # alert on notifications / calls
+    "update_check": True,               # ask GitHub for a newer release (notify only)
     "audio_mode": "Pulse", "audio_source": SYSTEM_AUDIO,
     "audio_sens": 50, "audio_smooth": 40, "audio_floor": 8,
     # named snapshots of the LIGHT tab; starters until the user changes the list
@@ -549,6 +551,41 @@ def acquire_single_instance_lock():
         return None
 
 
+# ---- update check: one request to GitHub's "latest release" endpoint ----
+# Sends only a standard HTTPS request (app name + version in the User-Agent, which
+# GitHub requires). Notify-only: it never downloads or runs anything.
+RELEASES_API = "https://api.github.com/repos/TGDRangaka/RGBZap/releases/latest"
+UPDATE_EVERY_MS = 24 * 3600 * 1000      # re-check daily while the app sits in the tray
+UPDATE_RETRY_MS = 3600 * 1000           # after a failed check (offline), try again in 1 h
+
+
+def parse_version(s):
+    """'v1.2.3' / '1.2.3' -> (1, 2, 3); anything else (beta tags, junk) -> None."""
+    m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", (s or "").strip()) if isinstance(s, str) else None
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def parse_release(data, current=APP_VERSION):
+    """(version, page_url) if `data` (GitHub's latest-release JSON) is a public release
+    newer than `current`, else None. The page must be on this project's GitHub, so an
+    odd response can never make the app open some other site."""
+    if not isinstance(data, dict) or data.get("draft") or data.get("prerelease"):
+        return None
+    new, cur, url = parse_version(data.get("tag_name")), parse_version(current), data.get("html_url")
+    if not new or not cur or new <= cur:      # tuples compare numerically: 1.10 > 1.9
+        return None
+    if not isinstance(url, str) or not url.startswith(APP_URL + "/"):
+        return None
+    return ".".join(map(str, new)), url
+
+
+def fetch_latest_release(urlopen=urllib.request.urlopen, timeout=8):
+    req = urllib.request.Request(RELEASES_API, headers={
+        "User-Agent": f"RGBZap/{APP_VERSION}", "Accept": "application/vnd.github+json"})
+    with urlopen(req, timeout=timeout) as r:
+        return json.load(r)
+
+
 class BleWorker:
     """Runs an asyncio loop in a background thread and holds one persistent client.
 
@@ -679,11 +716,24 @@ class BleWorker:
         self.status_cb("No strip found — is it on and the phone app closed?")
         return None
 
-    async def _scan_all(self, timeout=8.0):
+    async def _scan_all(self, timeout=8.0, everything=False):
         """Every strip in range as [(name, address)]. Read-only: doesn't touch the
-        current link (a connected strip stops advertising, so it won't be listed)."""
-        devices = await BleakScanner.discover(timeout=timeout)
-        return [(d.name, d.address) for d in devices if is_strip_name(d.name)]
+        current link (a connected strip stops advertising, so it won't be listed).
+        everything=True also lists other named Bluetooth devices, for strips whose
+        advertised name isn't recognised: known strips first, then strongest signal
+        (usually the one on your desk), capped so the list stays usable."""
+        if not everything:
+            devices = await BleakScanner.discover(timeout=timeout)
+            return [(d.name, d.address) for d in devices if is_strip_name(d.name)]
+        found = await BleakScanner.discover(timeout=timeout, return_adv=True)
+        rows = []
+        for dev, adv in found.values():
+            name = adv.local_name or dev.name
+            if name:                          # nameless devices can't be told apart
+                rssi = adv.rssi if adv.rssi is not None else -127
+                rows.append((not is_strip_name(name), -rssi, name, dev.address))
+        rows.sort()
+        return [(name, addr) for _, _, name, addr in rows[:20]]
 
     async def _select(self, addr):
         """Switch to a user-picked strip: remember it, release any other strip,
@@ -1321,6 +1371,10 @@ class App:
 
         # plain bools (not Tk vars): the watcher thread reads them
         self.notify_flash, self.notify_call = cfg["notify_flash"], cfg["notify_call"]
+        self.update_check = cfg["update_check"]
+        self.update_info = None             # (version, page url) once a newer release is seen
+        self._update_job = None             # pending root.after id of the next check
+        self._update_busy = False
         self.notifier = NotificationWatcher(
             self._on_notification, lambda: setattr(self.ble, "alert_cancel", True),
             self.set_status)
@@ -1364,6 +1418,10 @@ class App:
         # === tabbed deck ==================================================
         self.tabbar = tk.Canvas(root, height=36, bg=INK, highlightthickness=0, bd=0)
         self.tabbar.pack(fill="x")
+        # hidden until a newer release is found; packed above the tabs by _set_update
+        self.update_banner = tk.Label(root, font=FONT_BODY, fg="white", bg=SYNC_BLUE,
+                                      cursor="hand2", pady=6)
+        self.update_banner.bind("<Button-1>", lambda _e: self.open_update())
         nb = ttk.Notebook(root, style="Deck.TNotebook")
         nb.pack(fill="both", expand=True)
         self.nb = nb
@@ -1378,10 +1436,11 @@ class App:
         # strip picker: pick a strip to connect + save it; ↻ scans; switch = link on/off
         self.strips = [list(s) for s in cfg["strips"]]   # saved [name, address]
         self._found = []                                 # last scan, not yet saved
+        self._found_names = {}                           # address -> name seen in a scan
         self._choices = []                               # (name, address) per combo row
         self._eyebrow(light, "Light strip").pack(fill="x")
         lr = tk.Frame(light, bg=PANEL)
-        lr.pack(fill="x", pady=(4, 14))
+        lr.pack(fill="x", pady=(4, 0))
         self.strip_var = tk.StringVar()
         self.strip_cb = self._combo(lr, self.strip_var, [], 20, self.on_strip_pick)
         self.strip_cb.pack(side="left", fill="x", expand=True)
@@ -1392,6 +1451,12 @@ class App:
         self.scan_btn = self._flat(lr, "↻", self.on_strip_scan, pady=3)
         self.scan_btn.config(padx=8, font=("Segoe UI Symbol", 11))
         self.scan_btn.pack(side="right", padx=(6, 0))
+        self.all_devs_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(light, text="Show all Bluetooth devices (strip not listed?)",
+                       variable=self.all_devs_var, anchor="w", font=("Segoe UI", 9),
+                       fg=MUTE, bg=PANEL, selectcolor=PANEL2, activebackground=PANEL,
+                       activeforeground=TEXT, highlightthickness=0, bd=0
+                       ).pack(fill="x", pady=(2, 14))
         self._refresh_strips(self._saved_address())
         self._draw_link(True)                 # launch auto-connects right away
 
@@ -1587,12 +1652,21 @@ class App:
                      font=FONT_BODY, fg=MUTE, bg=PANEL, anchor="w").pack(fill="x", pady=(6, 0))
         self.on_notify_toggle()
 
+        self._eyebrow(system, "Updates").pack(fill="x", pady=(16, 4))
+        self.update_var = tk.BooleanVar(value=self.update_check)
+        self._check(system, "Check for updates automatically", self.update_var,
+                    self.on_update_toggle)
+
         # about footer, pinned to the bottom of the tab
         about = tk.Frame(system, bg=PANEL)
         about.pack(side="bottom", fill="x")
         tk.Frame(about, bg=LINE, height=1).pack(fill="x", pady=(0, 10))
-        tk.Label(about, text=f"RGBZAP {APP_VERSION}", font=FONT_EYE, fg=MUTE, bg=PANEL,
-                 anchor="w").pack(fill="x")
+        ver = tk.Frame(about, bg=PANEL)
+        ver.pack(fill="x")
+        tk.Label(ver, text=f"RGBZAP {APP_VERSION}", font=FONT_EYE, fg=MUTE, bg=PANEL
+                 ).pack(side="left")
+        self._link(ver, "Check for updates", cmd=lambda: self._run_update_check(manual=True)
+                   ).pack(side="right")
         by = tk.Frame(about, bg=PANEL)
         by.pack(fill="x", pady=(2, 0))
         tk.Label(by, text="© 2026", font=FONT_BODY, fg=TEXT, bg=PANEL).pack(side="left")
@@ -1625,6 +1699,68 @@ class App:
         resume = (cfg["effect"], cfg["speed"]) if self.mode == "effect" else None
         self.ble.submit(self._launch(resume))
         self.root.after(2000, self._autosave)
+        if self.update_check:                 # first look a few seconds after launch
+            self._schedule_update_check(5000)
+
+    # ---- update check (notify only: the user downloads and installs) ----
+    def _schedule_update_check(self, delay_ms):
+        if self._update_job is not None:
+            self.root.after_cancel(self._update_job)
+        self._update_job = self.root.after(delay_ms, self._update_tick)
+
+    def _update_tick(self):
+        self._update_job = None
+        if self.update_check:
+            self._run_update_check(manual=False)
+
+    def _run_update_check(self, manual):
+        if self._update_busy:
+            return
+        self._update_busy = True
+
+        def work():                           # network off the Tk thread
+            try:
+                result = ("ok", parse_release(fetch_latest_release()))
+            except Exception:
+                result = ("fail", None)
+            self.root.after(0, self._update_done, result, manual)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _update_done(self, result, manual):
+        self._update_busy = False
+        state, info = result
+        if state == "ok":
+            self._set_update(info)
+            if manual:
+                self.set_status(f"RGBZap {info[0]} is available — click the blue bar to "
+                                "download" if info else "RGBZap is up to date")
+        elif manual:
+            self.set_status("Couldn't check for updates — are you online?")
+        if self.update_check:                 # next look: a day on success, an hour if offline
+            self._schedule_update_check(UPDATE_EVERY_MS if state == "ok" else UPDATE_RETRY_MS)
+
+    def _set_update(self, info):
+        self.update_info = info
+        if info:
+            self.update_banner.config(text=f"↑  RGBZap {info[0]} is available — click to download")
+            if not self.update_banner.winfo_ismapped():
+                self.update_banner.pack(before=self.tabbar, fill="x", pady=(0, 10))
+        else:
+            self.update_banner.pack_forget()
+
+    def open_update(self):
+        if self.update_info:
+            webbrowser.open(self.update_info[1])
+
+    def on_update_toggle(self):
+        self.update_check = self.update_var.get()
+        if self.update_check:
+            self._schedule_update_check(2000)
+        else:
+            if self._update_job is not None:
+                self.root.after_cancel(self._update_job)
+                self._update_job = None
+            self._set_update(None)
 
     async def _launch(self, resume):
         await self.ble._connect(fx=True)
@@ -1649,6 +1785,7 @@ class App:
             "custom": [list(c) for c in self.custom],
             "strips": [list(s) for s in self.strips],
             "notify_flash": self.notify_flash, "notify_call": self.notify_call,
+            "update_check": self.update_check,
             "audio_mode": self.audio.mode, "audio_source": self.audio.source,
             "audio_sens": self.audio.sensitivity, "audio_smooth": self.audio.smoothing,
             "audio_floor": self.audio.floor,
@@ -1734,11 +1871,11 @@ class App:
             b.bind("<Leave>", lambda e: b.config(bg=bg))
         return b
 
-    def _link(self, parent, text, url):
-        """Blue text that opens url in the browser; underlines on hover."""
+    def _link(self, parent, text, url=None, cmd=None):
+        """Blue text that opens url in the browser (or runs cmd); underlines on hover."""
         lb = tk.Label(parent, text=text, font=FONT_BODY, fg=SYNC_BLUE, bg=PANEL,
                       cursor="hand2")
-        lb.bind("<Button-1>", lambda _e: webbrowser.open(url))
+        lb.bind("<Button-1>", lambda _e: cmd() if cmd else webbrowser.open(url))
         lb.bind("<Enter>", lambda _e: lb.config(font=FONT_BODY + ("underline",)))
         lb.bind("<Leave>", lambda _e: lb.config(font=FONT_BODY))
         return lb
@@ -1795,7 +1932,7 @@ class App:
             self.link_lbl.config(text=txt, fg=color)
             addr = self.ble.address
             if state and addr:                # auto-connected strips get saved too
-                self._remember_strip("Light strip", addr)
+                self._remember_strip(self._found_names.get(addr, "Light strip"), addr)
                 self._refresh_strips(addr)
             self._draw_link()
         self.root.after(0, _apply)
@@ -1947,15 +2084,28 @@ class App:
         if i < 0:
             return
         name, addr = self._choices[i]
-        self._remember_strip(name, addr)
+        if not (is_strip_name(name) or any(a == addr for _, a in self.strips)):
+            # not a known strip name: RGBZap would send light commands to it, so ask
+            if not messagebox.askokcancel(
+                    "Not a known light strip",
+                    f"RGBZap doesn't recognize \"{name}\" as an LED strip.\n\n"
+                    "It will send light commands to this device. Only continue if it "
+                    "is your light strip.", parent=self.root):
+                self._refresh_strips(self.ble.address)   # put the dropdown back
+                return
+            # saved to the list only once it actually connects (see set_connected)
+        else:
+            self._remember_strip(name, addr)
         self._refresh_strips(addr)
         self._draw_link(True)
         self.ble.submit(self.ble._select(addr))
 
     def on_strip_scan(self):
         self.scan_btn.config(state="disabled")
-        self.set_status("Scanning for strips...")
-        fut = self.ble.submit(self.ble._scan_all())
+        everything = self.all_devs_var.get()
+        self.set_status("Scanning for Bluetooth devices..." if everything
+                        else "Scanning for strips...")
+        fut = self.ble.submit(self.ble._scan_all(everything=everything))
         fut.add_done_callback(lambda f: self.root.after(0, self._strip_scan_done, f))
 
     def _strip_scan_done(self, fut):
@@ -1965,13 +2115,19 @@ class App:
         except Exception as e:
             self.set_status(f"Scan failed: {e}")
             return
+        self._found_names.update({a: n for n, a in self._found})
         for name, addr in self._found:        # refresh names of strips we already saved
             if any(a == addr for _, a in self.strips):
                 self._remember_strip(name, addr)
         self._refresh_strips(self.ble.address)
         n = len(self._found)
-        self.set_status(f"Found {n} strip{'s' * (n != 1)} — pick one above" if n
-                        else "No strips found — is it on and the phone app closed?")
+        if self.all_devs_var.get():
+            self.set_status(f"Found {n} Bluetooth device{'s' * (n != 1)} — closest first, "
+                            "pick your strip above" if n else "No Bluetooth devices found")
+        else:
+            self.set_status(f"Found {n} strip{'s' * (n != 1)} — pick one above" if n
+                            else "No strips found — is it on and the phone app closed? "
+                                 "Try \"Show all Bluetooth devices\"")
 
     def on_link_toggle(self):
         if self.ble._want_connected:
@@ -2512,6 +2668,9 @@ class App:
 
         menu = Menu(
             Item("Show RGBZap", act(self.show_window), default=True),   # left-click
+            Item(lambda _i: f"Update to {self.update_info[0]} available"
+                 if self.update_info else "Update available",
+                 act(self.open_update), visible=lambda _i: bool(self.update_info)),
             Menu.SEPARATOR,
             Item("Turn on", act(lambda: self.send(cmd_on()))),
             Item("Turn off", act(self.on_off)),
@@ -2639,6 +2798,37 @@ def _selftest():
         json.dump({"strips": [["Desk", "AA:BB"], ["", "CC"], ["x"], 5, ["Bed", "DD:EE"]]}, f)
     assert load_settings(p)["strips"] == [["Desk", "AA:BB"], ["Bed", "DD:EE"]], "strips"
     print("OK  settings round-trip + validation + corrupt fallback + custom colors")
+
+    # update check: numeric version compare, only public newer releases on our own
+    # GitHub page, and a setting that defaults on but honours a saved off
+    assert DEFAULT_SETTINGS["update_check"] is True
+    for raw, want in (({"update_check": False}, False), ({"update_check": "no"}, True)):
+        with open(p, "w") as f:
+            json.dump(raw, f)
+        assert load_settings(p)["update_check"] is want, f"update_check {raw}"
+    assert parse_version("v1.0.1") == (1, 0, 1) and parse_version("1.10.0") == (1, 10, 0)
+    assert all(parse_version(x) is None for x in ("1.0", "v1.0.1-beta", "", None, "latest", 5))
+    rel = {"tag_name": "v1.0.1", "html_url": APP_URL + "/releases/tag/v1.0.1",
+           "draft": False, "prerelease": False}
+    assert parse_release(rel, "1.0.0") == ("1.0.1", rel["html_url"]), "newer not seen"
+    assert parse_release(rel, "1.0.1") is None and parse_release(rel, "1.0.2") is None
+    assert parse_release(dict(rel, tag_name="v1.10.0"), "1.9.0")[0] == "1.10.0", "1.10 > 1.9"
+    assert parse_release(dict(rel, draft=True), "1.0.0") is None, "draft offered"
+    assert parse_release(dict(rel, prerelease=True), "1.0.0") is None, "prerelease offered"
+    assert parse_release(dict(rel, html_url="https://evil.example/x"), "1.0.0") is None
+    assert parse_release(dict(rel, html_url=None), "1.0.0") is None
+    assert parse_release(dict(rel, tag_name="nightly"), "1.0.0") is None
+    assert parse_release("junk") is None and parse_release(None) is None
+    import io
+    seen = []
+
+    def fake_open(req, timeout):
+        seen.append((req.full_url, req.get_header("User-agent"), timeout))
+        return io.BytesIO(json.dumps(rel).encode())
+    assert fetch_latest_release(fake_open) == rel
+    assert seen == [(RELEASES_API, f"RGBZap/{APP_VERSION}", 8)], seen
+    print("OK  update check: numeric compare, public+own-page only, request is one "
+          "plain GET, setting defaults on")
 
     # picker: the drawn field and the click mapping agree pixel-for-pixel
     W, H = 300, 180
@@ -2800,8 +2990,26 @@ def _selftest():
             FakeClient.log.append(bytes(data))
         log = []
 
-    global BleakClient, ADDR_FILE
+    class _Dev:
+        def __init__(self, name, address): self.name, self.address = name, address
+
+    class _Adv:
+        def __init__(self, name, rssi): self.local_name, self.rssi = name, rssi
+
+    class FakeScanner:
+        # one strip, a near-by pair of headphones, a unnamed phone, an unrecognised strip
+        nearby = [("ELK-BLEDOM", "AA:01", -80), ("WH-1000XM4", "AA:02", -40),
+                  (None, "AA:03", -30), ("MyStrip123", "AA:04", -60)]
+
+        @staticmethod
+        async def discover(timeout=5.0, return_adv=False, **_kw):
+            if return_adv:
+                return {a: (_Dev(n, a), _Adv(n, r)) for n, a, r in FakeScanner.nearby}
+            return [_Dev(n, a) for n, a, _r in FakeScanner.nearby]
+
+    global BleakClient, BleakScanner, ADDR_FILE
     real, BleakClient = BleakClient, FakeClient
+    real_scanner, BleakScanner = BleakScanner, FakeScanner
     real_addr_file, ADDR_FILE = ADDR_FILE, os.path.join(os.path.dirname(p), "addr.txt")
     try:
         w = BleWorker(lambda *_: None, lambda *_: None)
@@ -2850,10 +3058,19 @@ def _selftest():
         assert steady in log[last_flash:] and log[-1] == sync_frame, \
             "after the alert: restore the steady color, then the held sync frame"
         assert not w._alert_on and not w._held, "alert state left behind"
+
+        # scan: normal = known strips only; everything = strips first, then closest
+        got = w.submit(w._scan_all()).result(timeout=5)
+        assert got == [("ELK-BLEDOM", "AA:01")], f"normal scan changed: {got}"
+        got = w.submit(w._scan_all(everything=True)).result(timeout=5)
+        assert got == [("ELK-BLEDOM", "AA:01"), ("WH-1000XM4", "AA:02"),
+                       ("MyStrip123", "AA:04")], f"all-devices scan order: {got}"
+        FakeScanner.nearby = [(f"Dev{i}", f"BB:{i:02d}", -90 + i) for i in range(40)]
+        assert len(w.submit(w._scan_all(everything=True)).result(timeout=5)) == 20, "cap"
     finally:
-        BleakClient, ADDR_FILE = real, real_addr_file
+        BleakClient, BleakScanner, ADDR_FILE = real, real_scanner, real_addr_file
     print("OK  BLE: single client under concurrent connects, reconnect, honours disconnect,"
-          " strip switching, alert restore")
+          " strip switching, alert restore, all-devices scan")
 
 
 if __name__ == "__main__":
