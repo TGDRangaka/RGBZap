@@ -253,13 +253,162 @@ class Police:
         return self.PATTERN[int(self.t / 0.16) % len(self.PATTERN)]
 
 
+class Drift:
+    """Slow wander through a palette (picks its colors): eases from one palette color to
+    the next over a few seconds, with a gentle brightness swell on top. It turns around
+    at the ends of the palette (ping-pong) so only neighbouring colors ever blend."""
+    PICKS_COLOR = True
+    SWELL_PERIOD = 11.0                           # seconds per brightness swell
+
+    def __init__(self, palette, swell=0.18, hold=(4.0, 9.0), rng=None):
+        import random
+        self.palette, self.swell, self.hold = palette, swell, hold
+        self.rng = rng or random.Random()
+        self.i, self.dir = 0, 1
+        self.j = self._advance(0)                 # color we're blending toward
+        self.t, self.dur = 0.0, self.rng.uniform(*hold)
+        self.clock = 0.0
+        self.phase = self.rng.random() * 2 * math.pi   # tiles shouldn't all swell in step
+
+    def _advance(self, i):
+        if not 0 <= i + self.dir < len(self.palette):
+            self.dir = -self.dir
+        return i + self.dir
+
+    def step(self, dt, speed=50):
+        sf = _sf(speed)
+        self.t += dt * sf
+        self.clock += dt * sf
+        while self.t >= self.dur:                 # a very slow tick can't skip a color
+            self.t -= self.dur
+            self.i, self.j = self.j, self._advance(self.j)
+            self.dur = self.rng.uniform(*self.hold)
+        f = self.t / self.dur
+        f = f * f * (3 - 2 * f)                   # ease in/out
+        a, b = self.palette[self.i], self.palette[self.j]
+        lvl = 1.0 - self.swell * (0.5 - 0.5 * math.cos(
+            self.phase + 2 * math.pi * self.clock / self.SWELL_PERIOD))
+        return tuple(max(0, min(255, int(round((x + (y - x) * f) * lvl))))
+                     for x, y in zip(a, b))
+
+
+# name -> (palette, swell depth) for the slow "Ambient" effects. Each palette lists
+# neighbours that blend cleanly (no muddy grey from complementary colors).
+DRIFT_PALETTES = {
+    "Aurora":    ([(0, 255, 110), (0, 230, 190), (40, 140, 255), (140, 60, 255)], 0.20),
+    "Lava lamp": ([(255, 30, 0), (255, 110, 0), (255, 0, 70), (190, 0, 140)], 0.25),
+    "Vaporwave": ([(255, 50, 190), (150, 70, 255), (0, 200, 255)], 0.12),
+    "Sunset":    ([(255, 200, 60), (255, 110, 0), (255, 40, 60), (170, 20, 140),
+                   (60, 20, 130)], 0.15),
+    "Forest":    ([(0, 110, 20), (60, 200, 40), (0, 170, 90), (130, 220, 50)], 0.30),
+    "Galaxy":    ([(30, 0, 120), (110, 0, 200), (0, 50, 210), (190, 0, 160)], 0.35),
+    "Ice":       ([(160, 225, 255), (40, 140, 255), (0, 200, 220), (225, 245, 255)], 0.10),
+}
+
+
+class Breath478:
+    """Guided breathing on your color: swell in for 4 s, hold 7 s, ease out for 8 s (the
+    4-7-8 pattern). One breath is 19 s at the natural speed; the speed slider changes
+    the pace."""
+    CYCLE, LOW = 19.0, 0.08
+
+    def __init__(self):
+        self.t = 0.0
+
+    def step(self, dt, speed=50):
+        self.t = (self.t + dt * _sf(speed)) % self.CYCLE
+        t, lo = self.t, self.LOW
+        if t < 4.0:                               # inhale
+            return lo + (1 - lo) * (0.5 - 0.5 * math.cos(math.pi * t / 4.0))
+        if t < 11.0:                              # hold
+            return 1.0
+        return lo + (1 - lo) * (0.5 + 0.5 * math.cos(math.pi * (t - 11.0) / 8.0))  # exhale
+
+
+class NeonFlicker:
+    """A neon sign on its last legs: a steady, faintly humming glow on your color with
+    the odd stutter of one to three quick dropouts."""
+    def __init__(self, rng=None):
+        import random
+        self.rng = rng or random.Random()
+        self.seq = []                             # levels still to play, one per tick
+        self.t = 0.0
+
+    def step(self, dt, speed=50):
+        r, sf = self.rng, _sf(speed)
+        if not self.seq and r.random() < dt * 0.2 * sf:       # a stutter begins
+            for _ in range(r.randint(1, 3)):
+                self.seq += [r.uniform(0.12, 0.45)] + [r.uniform(0.85, 1.0)] * r.randint(1, 2)
+        if self.seq:
+            return self.seq.pop(0)
+        self.t += dt * sf
+        return 0.93 + 0.07 * math.sin(self.t * 7.0)           # the hum
+
+
+class Fireworks:
+    """Near-dark sky with a burst every second or two: a flash in a random color that
+    sparkles and fades like a spent rocket (picks its colors)."""
+    PICKS_COLOR = True
+    SKY, LIFE = (1, 2, 8), 1.6
+
+    def __init__(self, rng=None):
+        import random
+        self.rng = rng or random.Random()
+        self.wait, self.age, self.rgb = self.rng.uniform(0.3, 1.2), None, (0, 0, 0)
+
+    def step(self, dt, speed=50):
+        r, sf = self.rng, _sf(speed)
+        if self.age is None:                      # waiting for the next rocket
+            self.wait -= dt * sf
+            if self.wait > 0:
+                return self.SKY
+            self.age, self.rgb = 0.0, hs_rgb(r.random(), r.uniform(0.75, 1.0))
+        self.age += dt * sf
+        x = self.age / self.LIFE
+        if x >= 1.0:
+            self.age, self.wait = None, r.uniform(0.8, 2.6)
+            return self.SKY
+        lvl = (1.0 - x) ** 2 * (0.7 + 0.3 * r.random())       # fade + sparkle
+        return tuple(max(s, int(c * lvl)) for s, c in zip(self.SKY, self.rgb))
+
+
+class Party:
+    """Disco: hops to a fresh bright color every ~0.6 s with a pulse on each hop (picks
+    its colors). Hops are capped at ~2 per second at any speed, so it stays a party,
+    not a strobe."""
+    PICKS_COLOR = True
+
+    def __init__(self, rng=None):
+        import random
+        self.rng = rng or random.Random()
+        self.t, self.hue = 0.0, self.rng.random()
+
+    def step(self, dt, speed=50):
+        hop = max(0.45, 0.6 / _sf(speed))
+        self.t += dt
+        if self.t >= hop:
+            self.t -= hop
+            self.hue = (self.hue + self.rng.uniform(0.18, 0.5)) % 1.0
+        lvl = 1.0 - 0.45 * (self.t / hop)         # bright on the hop, easing down
+        return tuple(int(c * lvl) for c in hs_rgb(self.hue, 1.0))
+
+
 # name -> factory for every app-driven effect (they stop when RGBZap quits; the
 # controller's built-in EFFECTS keep running without the PC)
 SOFT_EFFECTS = {
     **{name: (lambda p=p: Flame(*p)) for name, p in FLAME_EFFECTS.items()},
-    "Breathe": Breathe, "Heartbeat": Heartbeat, "Lightning": Lightning,
-    "Rainbow": Rainbow, "Ocean": Ocean, "Police": Police,
+    "Breathe": Breathe, "Breath 4-7-8": Breath478, "Heartbeat": Heartbeat,
+    "Neon flicker": NeonFlicker, "Lightning": Lightning, "Fireworks": Fireworks,
+    "Rainbow": Rainbow, "Ocean": Ocean, "Police": Police, "Party": Party,
+    **{name: (lambda p=p, s=s: Drift(p, s)) for name, (p, s) in DRIFT_PALETTES.items()},
 }
+
+# how the Effects tab and tray menu sort SOFT_EFFECTS (every effect in exactly one group)
+SOFT_GROUPS = [
+    ("Ambient", ["Rainbow", "Ocean", *DRIFT_PALETTES]),
+    ("Flames & pulses", [*FLAME_EFFECTS, "Breathe", "Breath 4-7-8", "Heartbeat",
+                         "Neon flicker", "Lightning", "Fireworks", "Police", "Party"]),
+]
 
 # ---- notification / call alerts ----
 # ponytail: wording heuristic, English only; add per-app rules if a caller app is missed
@@ -445,6 +594,7 @@ LINE, TEXT, MUTE = "#262D3A", "#E8ECF4", "#8592A6"
 GOOD, BAD = "#37D39A", "#FF5D5D"
 SYNC_BLUE = "#3B82F6"
 AUDIO_PINK = "#E0479E"
+FX_COLS, FX_ASPECT = 4, 2.5           # Effects tab tiles: columns per row, width : height
 FONT_H1   = ("Bahnschrift SemiBold", 18)
 FONT_EYE  = ("Bahnschrift SemiBold", 9)
 FONT_TAB  = ("Bahnschrift SemiBold", 10)
@@ -2266,10 +2416,13 @@ class App:
         c = self.fx_canvas
         c.delete("all")
         self._fx_tiles, self._fx_shown, self._fx_active = {}, {}, False
-        cols, gap, edge = 5, 10, 5                       # edge: room for the active ring
-        tile = (w - 2 * edge - gap * (cols - 1)) // cols
-        groups = [("In RGBZap · stops when the app closes", [(None, "None")] +
-                   [(n, n) for n in SOFT_EFFECTS])]
+        cols, gap, edge = FX_COLS, 10, 5                 # edge: room for the active ring
+        tw = (w - 2 * edge - gap * (cols - 1)) // cols   # tile width
+        th = round(tw / FX_ASPECT)                       # tile height
+        pitch = th + 28                                  # row to row: tile + label + air
+        groups = [(f"{title} · stops when the app closes",
+                   ([(None, "None")] if k == 0 else []) + [(n, n) for n in names])
+                  for k, (title, names) in enumerate(SOFT_GROUPS)]
         for kind in ("Jump", "Crossfade", "Blink"):
             groups.append((f"On the strip · {kind}", [(n, n.partition(" ")[2])
                                                       for n in EFFECTS
@@ -2280,24 +2433,24 @@ class App:
                           font=FONT_EYE)
             y += 24
             for i, (name, label) in enumerate(items):
-                x0 = edge + (i % cols) * (tile + gap)
-                y0 = y + (i // cols) * (tile + 30)
+                x0 = edge + (i % cols) * (tw + gap)
+                y0 = y + (i // cols) * pitch
                 tag = f"fx{len(self._fx_tiles)}"
-                ring = self._rrect(c, x0 - 4, y0 - 4, x0 + tile + 4, y0 + tile + 4, 12,
+                ring = self._rrect(c, x0 - 4, y0 - 4, x0 + tw + 4, y0 + th + 4, 12,
                                    fill="", outline="", width=2, tags=tag)
-                glow = self._rrect(c, x0 - 2, y0 - 2, x0 + tile + 2, y0 + tile + 2, 10,
+                glow = self._rrect(c, x0 - 2, y0 - 2, x0 + tw + 2, y0 + th + 2, 10,
                                    fill=PANEL, outline="", tags=tag)
-                if name is None:                 # empty square, red cross: no effect
-                    face = self._rrect(c, x0, y0, x0 + tile, y0 + tile, 8, fill=PANEL,
+                if name is None:                 # empty tile, red cross: no effect
+                    face = self._rrect(c, x0, y0, x0 + tw, y0 + th, 8, fill=PANEL,
                                        outline=LINE, dash=(3, 3), tags=tag)
-                    m = tile // 4
-                    for xa, xb in ((x0 + m, x0 + tile - m), (x0 + tile - m, x0 + m)):
-                        c.create_line(xa, y0 + m, xb, y0 + tile - m, fill=BAD, width=2,
+                    cx, cy, h = x0 + tw / 2, y0 + th / 2, th * 0.28
+                    for ya, yb in ((cy - h, cy + h), (cy + h, cy - h)):
+                        c.create_line(cx - h, ya, cx + h, yb, fill=BAD, width=2,
                                       capstyle="round", tags=tag)
                 else:
-                    face = self._rrect(c, x0, y0, x0 + tile, y0 + tile, 8, fill=PANEL2,
+                    face = self._rrect(c, x0, y0, x0 + tw, y0 + th, 8, fill=PANEL2,
                                        outline=LINE, tags=tag)
-                text = c.create_text(x0 + tile / 2, y0 + tile + 12, text=label, fill=MUTE,
+                text = c.create_text(x0 + tw / 2, y0 + th + 12, text=label, fill=MUTE,
                                      font=("Segoe UI", 8), tags=tag)
                 self._fx_tiles[name] = (ring, glow, face, text)
                 c.tag_bind(tag, "<Button-1>", lambda _e, n=name: self.on_fx_pick(n))
@@ -2305,7 +2458,7 @@ class App:
                     c.itemconfig(f, outline=MUTE), c.config(cursor="hand2")))
                 c.tag_bind(tag, "<Leave>", lambda _e, f=face: (
                     c.itemconfig(f, outline=LINE), c.config(cursor="")))
-            y += ((len(items) + cols - 1) // cols) * (tile + 30) + 6
+            y += ((len(items) + cols - 1) // cols) * pitch + 6
         c.config(scrollregion=(0, -6, w, y))
         self._fx_render()
 
@@ -2658,9 +2811,11 @@ class App:
             self.effect_var.set(name)
             self.on_effect()
 
-        effects = [Item(n, act(lambda n=n: pick_effect(n))) for n in SOFT_EFFECTS]
-        effects += [Menu.SEPARATOR] + [Item(n, act(lambda n=n: pick_effect(n)))
-                                       for n in EFFECTS]
+        effects = [Item(title, Menu(*[Item(n, act(lambda n=n: pick_effect(n)))
+                                      for n in names]))
+                   for title, names in SOFT_GROUPS]
+        effects.append(Item("On the strip", Menu(*[Item(n, act(lambda n=n: pick_effect(n)))
+                                                   for n in EFFECTS])))
         effects += [Menu.SEPARATOR, Item("Effect off", act(self.on_effect_off))]
         bright = [Item(f"{v}%", act(lambda v=v: self.bright.set(v)),
                        checked=lambda _i, v=v: self.brightness == v, radio=True)
@@ -2886,6 +3041,65 @@ def _selftest():
     assert len(hues) >= 9, f"Rainbow should cover the wheel, saw {sorted(hues)}"
     print("OK  software effects: valid output at all speeds; breathe/heartbeat/lightning/"
           "rainbow behave")
+
+    # the Effects tab / tray grouping covers every app effect exactly once
+    grouped = [n for _t, names in SOFT_GROUPS for n in names]
+    assert sorted(grouped) == sorted(SOFT_EFFECTS), "SOFT_GROUPS out of step with SOFT_EFFECTS"
+    assert not set(SOFT_EFFECTS) & set(EFFECTS), "app and strip effects share a name"
+
+    # Drift: each palette is walked end to end and back, only neighbours blend, fades
+    # are smooth (no jumps between 80 ms ticks), and the swell never goes dark
+    for name, (pal, swell) in DRIFT_PALETTES.items():
+        d = Drift(pal, swell, rng=random.Random(7))
+        outs = [d.step(SEND_INTERVAL, 50) for _ in range(3000)]           # ~4 min
+        assert all(ok_out(o) for o in outs), f"{name} bad output"
+        jump = max(max(abs(a - b) for a, b in zip(o1, o2)) for o1, o2 in zip(outs, outs[1:]))
+        assert jump <= 25, f"{name} jumps {jump} in one tick"
+        floor = (1 - swell) * 0.8 * min(max(c) for c in pal)   # mid-blend dips ~15-20%
+        assert min(max(o) for o in outs) >= floor, f"{name} swells too dark"
+        walker, visited = Drift(pal, swell, rng=random.Random(7)), set()
+        for _ in range(6000):
+            walker.step(SEND_INTERVAL, 50)
+            visited.add(walker.i)
+            assert abs(walker.i - walker.j) == 1, f"{name} blends non-neighbours"
+        assert visited == set(range(len(pal))), f"{name} never reached all its colors"
+
+    # 4-7-8 breathing: 4 s up, 7 s held at full, 8 s down, 19 s per breath
+    b = Breath478()
+    lv = [b.step(0.05, 50) for _ in range(380)]                            # 19 s
+    assert lv[0] < 0.1 and lv[79] > 0.97, "inhale should rise over 4 s"
+    assert all(v == 1.0 for v in lv[84:218]), "hold should stay at full for 7 s"
+    assert lv[-1] < 0.12 and max(lv[220:]) < 1.0, "exhale should ease down over 8 s"
+
+    # neon: mostly steady, with real dropouts that always recover to bright
+    nf = NeonFlicker(rng=random.Random(11))
+    lv = [nf.step(SEND_INTERVAL, 50) for _ in range(3000)]
+    assert sum(v >= 0.85 for v in lv) > 0.85 * len(lv), "neon should mostly glow steadily"
+    assert min(lv) < 0.5 and lv[-1] >= 0.85 or nf.seq, "neon should stutter and recover"
+    dips = sum(1 for a, c in zip(lv, lv[1:]) if a >= 0.85 and c < 0.5)
+    assert 10 <= dips <= 120, f"neon stutter rate off: {dips} dips in 4 min"
+
+    # fireworks: dark most of the time, bursts in saturated colors, <= ~1 burst/second
+    fw = Fireworks(rng=random.Random(5))
+    outs = [fw.step(SEND_INTERVAL, 50) for _ in range(3000)]
+    bright = [o for o in outs if max(o) > 120]
+    assert 0.03 < len(bright) / len(outs) < 0.35, "fireworks should be mostly dark sky"
+    assert len({tuple(c > 120 for c in o) for o in bright}) >= 3, "bursts should vary in color"
+    rises = sum(1 for a, c in zip(outs, outs[1:]) if max(c) > 120 >= max(a))
+    assert 20 <= rises <= 140, f"{rises} bursts in 4 min"
+
+    # party: hops stay at or below ~2.2 per second even at top speed
+    for sp in (1, 50, 100):
+        pt = Party(rng=random.Random(2))
+        hues, last = [], None
+        for _ in range(1250):                                             # 100 s
+            rgb = pt.step(SEND_INTERVAL, sp)
+            if pt.hue != last:
+                hues.append(pt.hue)
+                last = pt.hue
+        assert len(hues) / 100 <= 2.3, f"party hops {len(hues) / 100:.1f}/s at speed {sp}"
+    print("OK  new effects: palettes walk neighbours smoothly, 4-7-8 timing, neon stutter, "
+          "fireworks bursts, party hop cap")
 
     # EFFECTS tab previews: every built-in animates with valid colors, in its own hues
     for name in EFFECTS:

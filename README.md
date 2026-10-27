@@ -21,8 +21,10 @@ Bluetooth LE.
 - **Light** — color picker, presets, your own saved colors, brightness, and **scenes**
   (save a color + brightness + effect under a name, apply it in one click).
 - **Effects** — every effect as a live preview tile, so you see what it does before you
-  pick it. Smooth flame, breathe, heartbeat, lightning, rainbow, ocean, police, plus the
-  strip's own built-in jump / crossfade / blink modes.
+  pick it. **Ambient** drifts (Aurora, Lava lamp, Vaporwave, Sunset, Forest, Galaxy, Ice,
+  Rainbow, Ocean); **flames & pulses** (Candle, Torch, Fire, Breathe, a
+  4-7-8 breathing guide, Heartbeat, Neon flicker, Lightning, Fireworks, Police, Party);
+  plus the strip's own built-in jump / crossfade / blink modes.
 - **Screen Sync (Ambilight)** — the strip follows a monitor's color in real time. Picks
   the *dominant* color so scenes pop instead of averaging to mud, and keeps a dim glow on
   dark scenes. Great for movies and games.
