@@ -1,6 +1,6 @@
 @echo off
 rem Build RGBZap for release (no Python needed to run the result). Produces, in dist\:
-rem   RGBZap\RGBZap.exe              - the app folder
+rem   RGBZap\RGBZap.exe + rgbzap.exe    - the app folder (rgbzap.exe = command line)
 rem   RGBZap-<ver>-windows.zip       - portable: unzip anywhere and run
 rem   RGBZap-Setup-<ver>.exe         - installer (only if Inno Setup 6 is installed)
 rem
@@ -35,6 +35,15 @@ rem BLE / capture backends that PyInstaller can't see by static analysis.
   --collect-all winrt ^
   elk_gui.py
 if errorlevel 1 (echo PyInstaller failed & exit /b 1)
+
+rem the command-line tool: a small console exe that talks to a running RGBZap
+%PY% -m PyInstaller --noconfirm --onefile --console --name rgbzap ^
+  --icon assets\rgbzap.ico ^
+  --distpath dist\cli --workpath build\cli --specpath build\cli ^
+  rgbzap_cli.py
+if errorlevel 1 (echo CLI build failed & exit /b 1)
+copy /Y dist\cli\rgbzap.exe dist\RGBZap\rgbzap.exe >nul
+if errorlevel 1 (echo Could not copy rgbzap.exe & exit /b 1)
 
 powershell -NoProfile -Command "Compress-Archive -Force -Path dist\RGBZap -DestinationPath dist\RGBZap-%VERSION%-windows.zip"
 if errorlevel 1 (echo Zipping failed & exit /b 1)

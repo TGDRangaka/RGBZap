@@ -38,10 +38,13 @@ OutputBaseFilename=RGBZap-Setup-{#AppVersion}
 ; close a running RGBZap (it hides in the tray) before replacing its files
 CloseApplications=force
 RestartApplications=no
+; tells Windows the PATH changed (the optional "rgbzap" command task) so new terminals see it
+ChangesEnvironment=yes
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Shortcuts:"
 Name: "startup"; Description: "Open RGBZap when &Windows starts"; GroupDescription: "Startup:"
+Name: "addpath"; Description: "Add the &rgbzap command to PATH (control RGBZap from a terminal)"; GroupDescription: "Command line:"; Flags: unchecked
 
 [Files]
 Source: "..\dist\RGBZap\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -54,6 +57,9 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopico
 ; same value the app's own "Open automatically when Windows starts" toggle writes
 Root: HKCU; Subkey: "{#RunKey}"; ValueType: string; ValueName: "{#AppName}"; \
   ValueData: """{app}\{#AppExe}"""; Tasks: startup
+; the per-user PATH, so `rgbzap color red` works in any new terminal (no admin needed)
+Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; \
+  ValueData: "{olddata};{app}"; Tasks: addpath; Check: NeedsAddPath(ExpandConstant('{app}'))
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "Launch {#AppName}"; \
@@ -63,10 +69,41 @@ Filename: "{app}\{#AppExe}"; Description: "Launch {#AppName}"; \
 // The app can turn "start with Windows" on later from its System tab, so the
 // uninstaller removes that entry whether or not the installer created it.
 // Settings in %APPDATA%\RGBZap are kept, so a reinstall picks up where you left off.
+// True unless the folder is already on the user's PATH (so re-installing never duplicates it).
+function NeedsAddPath(Dir: string): Boolean;
+var
+  Path: string;
+begin
+  if not RegQueryStringValue(HKCU, 'Environment', 'Path', Path) then
+  begin
+    Result := True;
+    exit;
+  end;
+  Result := Pos(';' + Uppercase(Dir) + ';', ';' + Uppercase(Path) + ';') = 0;
+end;
+
+// Takes the install folder back off the user's PATH when uninstalling.
+procedure RemoveFromPath(Dir: string);
+var
+  Path, Padded: string;
+  P: Integer;
+begin
+  if not RegQueryStringValue(HKCU, 'Environment', 'Path', Path) then
+    exit;
+  Padded := ';' + Path + ';';
+  P := Pos(';' + Uppercase(Dir) + ';', Uppercase(Padded));
+  if P = 0 then
+    exit;
+  Delete(Padded, P, Length(Dir) + 1);                  // removes ";Dir"
+  Path := Copy(Padded, 2, Length(Padded) - 2);         // drop the padding semicolons
+  RegWriteExpandStringValue(HKCU, 'Environment', 'Path', Path);
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usPostUninstall then
   begin
+    RemoveFromPath(ExpandConstant('{app}'));
     RegDeleteValue(HKCU, '{#RunKey}', '{#AppName}');
     RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run',
                    '{#AppName}');

@@ -8,3 +8,5 @@ soundcard>=0.4
 winrt-Windows.UI.Notifications>=3.2; sys_platform == "win32"
 winrt-Windows.UI.Notifications.Management>=3.2; sys_platform == "win32"
 winrt-Windows.ApplicationModel>=3.2; sys_platform == "win32"
+# OBS link (obs-websocket v5)
+websockets>=13

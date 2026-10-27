@@ -32,6 +32,7 @@ import threading
 import time
 import tkinter as tk
 import urllib.request
+from types import SimpleNamespace
 import webbrowser
 from tkinter import messagebox, simpledialog, ttk
 
@@ -41,6 +42,13 @@ from bleak import BleakScanner, BleakClient
 from elk_protocol import (NAME_PREFIXES, EFFECTS, is_strip_name, pick_write_char,
                           cmd_on, cmd_off, cmd_color, cmd_effect, cmd_effect_speed,
                           data_file)
+import rgbzap_api as api_mod
+import rgbzap_hotkeys as hotkeys
+import rgbzap_obs as obs_mod
+import rgbzap_onair as onair_mod
+import rgbzap_tools
+from rgbzap_comfort import FADES, FlashLimiter, apply_balance, fade_steps
+from rgbzap_sync import AREAS, crop_black_bars, select_area
 
 try:
     import winreg  # Windows only — used for the "run at startup" option
@@ -65,7 +73,7 @@ ADDR_FILE = data_file("address.txt", legacy=os.path.join(_HERE, "elk_address.txt
 # logo / icons; inside the built exe they're unpacked under sys._MEIPASS
 ASSETS = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))),
                       "assets")
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.2.0"
 APP_URL = "https://github.com/TGDRangaka/RGBZap"
 AUTHOR_URL = "https://dilshan-rangaka.vercel.app/"
 LOCK_PORT = 49731  # arbitrary localhost port used as a single-instance lock
@@ -422,14 +430,28 @@ def is_call(text):
     return bool(_CALL_RE.search(text or ""))
 
 
-def alert_frame(kind, t):
+ONAIR_MAX_S = 24 * 3600                 # an On-Air light holds until the camera/mic/OBS stops
+ONAIR_RED = (255, 0, 0)
+
+
+def alert_frame(kind, t, color=None, calm=False):
     """(r, g, b) for an alert at t seconds, or None when it's over.
-    notify: two quick white pulses (1 s). call: green swell until cancelled."""
-    if kind == "notify":
-        if t >= 1.0:
-            return None
-        lvl = math.sin(math.pi * (t % 0.5) / 0.5) ** 2
-        return (int(255 * lvl),) * 3
+    notify/flash: two quick pulses (1 s) in `color` (white by default); with calm=True
+    ("reduce flashing") a single slow swell instead. call: green swell until cancelled.
+    onair: steady red, until cancelled."""
+    if kind in ("notify", "flash"):
+        c = color or (255, 255, 255)
+        if calm:
+            if t >= 1.4:
+                return None
+            lvl = math.sin(math.pi * t / 1.4) ** 2
+        else:
+            if t >= 1.0:
+                return None
+            lvl = math.sin(math.pi * (t % 0.5) / 0.5) ** 2
+        return tuple(int(x * lvl) for x in c)
+    if kind == "onair":
+        return color or ONAIR_RED
     lvl = 0.15 + 0.85 * (0.5 - 0.5 * math.cos(2 * math.pi * t / 1.2))
     return (0, int(255 * lvl), int(60 * lvl))
 
@@ -468,6 +490,18 @@ def builtin_preview(name, t):
 
 # ---- persisted settings (restored on next launch) ----
 SETTINGS_FILE = data_file("settings.json", legacy=os.path.join(_HERE, "elk_settings.json"))
+# global hotkeys: action -> (label, default shortcut). No bare letters: on many keyboards
+# Ctrl+Alt is AltGr and Ctrl+Alt+letter types a character. "" = no default shortcut.
+HOTKEY_ACTIONS = {
+    "toggle_power":    ("Lights on / off",           "ctrl+alt+home"),
+    "brightness_up":   ("Brighter",                  "ctrl+alt+pageup"),
+    "brightness_down": ("Dimmer",                    "ctrl+alt+pagedown"),
+    "toggle_sync":     ("Screen sync on / off",      "ctrl+alt+end"),
+    "toggle_audio":    ("Audio reactive on / off",   "ctrl+alt+insert"),
+    "next_scene":      ("Next scene",                "ctrl+alt+shift+right"),
+    "prev_scene":      ("Previous scene",            "ctrl+alt+shift+left"),
+    "effect_off":      ("Effect off (steady color)", ""),
+}
 DEFAULT_SETTINGS = {
     "color": [255, 255, 255], "brightness": 100, "mode": "color",
     "effect": list(EFFECTS)[0], "speed": 50,
@@ -477,6 +511,17 @@ DEFAULT_SETTINGS = {
     "strips": [],                       # user's light strips: [[name, address], ...]
     "notify_flash": False, "notify_call": False,   # alert on notifications / calls
     "update_check": True,               # ask GitHub for a newer release (notify only)
+    "fade": "Smooth",                   # how color changes blend: Off / Quick / Smooth / Slow
+    "reduce_flash": False,              # soften flashing effects, alerts and sync cuts
+    "area": "Whole screen", "crop_bars": True,     # screen sync: where to sample, skip bars
+    "bal_r": 100, "bal_g": 100, "bal_b": 100,      # strip color balance (% gain per channel)
+    "hotkeys_on": True,
+    "hotkeys": {a: d for a, (_label, d) in HOTKEY_ACTIONS.items()},
+    "onair": False, "onair_cam": True, "onair_mic": False,   # red while camera / mic is on
+    "obs_on": False, "obs_host": "localhost", "obs_port": 4455, "obs_password": "",
+    "obs_live": True, "obs_rec": False,            # red while streaming / recording
+    "obs_scenes": {},                   # OBS scene name -> RGBZap scene name
+    "api_on": False, "api_port": 49732, "api_token": "",   # local control API (off by default)
     "audio_mode": "Pulse", "audio_source": SYSTEM_AUDIO,
     "audio_sens": 50, "audio_smooth": 40, "audio_floor": 8,
     # named snapshots of the LIGHT tab; starters until the user changes the list
@@ -533,11 +578,12 @@ _SETTING_CHOICES = {
     "mode": ("color", "effect"), "effect": {**SOFT_EFFECTS, **EFFECTS},
     "style": SYNC_STYLES,
     "extract": ("Dominant", "Average"), "dark": ("Dim", "Glow", "Keep"),
-    "audio_mode": AUDIO_MODES,
+    "audio_mode": AUDIO_MODES, "fade": FADES, "area": AREAS,
 }
 _SETTING_RANGES = {"brightness": (1, 100), "speed": (1, 100), "sat": (100, 250),
                    "smooth": (5, 100), "audio_sens": (1, 100), "audio_smooth": (0, 100),
-                   "audio_floor": (0, 50)}
+                   "audio_floor": (0, 50), "bal_r": (50, 100), "bal_g": (50, 100),
+                   "bal_b": (50, 100), "obs_port": (1, 65535), "api_port": (1024, 65535)}
 
 
 def load_settings(path=SETTINGS_FILE):
@@ -562,7 +608,17 @@ def load_settings(path=SETTINGS_FILE):
             cfg[k] = {name: {f: sc[f] for f in SCENE_FIELDS} for name, sc in v.items()
                       if type(name) is str and 0 < len(name) <= 40 and type(sc) is dict
                       and all(_valid_setting(f, sc.get(f)) for f in SCENE_FIELDS)}
-        elif k not in ("custom", "strips", "scenes") and _valid_setting(k, v):
+        elif k == "hotkeys":
+            saved = v if type(v) is dict else {}
+            cfg[k] = {a: (hotkeys.normalize(saved[a]) or "") if type(saved.get(a)) is str
+                      and (saved[a] == "" or hotkeys.normalize(saved[a])) else DEFAULT_SETTINGS[k][a]
+                      for a in HOTKEY_ACTIONS}
+        elif k == "obs_scenes" and type(v) is dict:
+            cfg[k] = {n: s for n, s in list(v.items())[:60]
+                      if type(n) is str and type(s) is str and 0 < len(n) <= 120
+                      and 0 < len(s) <= 40}
+        elif k not in ("custom", "strips", "scenes", "hotkeys", "obs_scenes") \
+                and _valid_setting(k, v):
             cfg[k] = v
     return cfg
 
@@ -572,6 +628,11 @@ def _valid_setting(k, v):
     if type(v) is not type(DEFAULT_SETTINGS[k]):
         return False
     if k == "color" and not _is_rgb(v):
+        return False
+    if k == "api_token" and v and not re.fullmatch(r"[0-9a-f]{32}", v):
+        return False                        # only tokens we generated (or none)
+    if k in ("obs_host", "obs_password") and not (len(v) <= (253 if k == "obs_host" else 200)
+                                                  and v.isprintable()):
         return False
     if k in _SETTING_CHOICES and v not in _SETTING_CHOICES[k]:
         return False
@@ -763,8 +824,12 @@ class BleWorker:
         self._last: dict[bytes, bytes] = {}  # frame kind -> latest sent, in send order
         self._held: dict[str, bytes] = {}    # channel frames queued while an alert plays
         self._alert_on = False
+        self._alert_kind = None
         self._alert_lock = asyncio.Lock()
         self.alert_cancel = False            # set from any thread: stop the current alert
+        self.onair_on = False                # set from any thread: keep the On-Air light lit
+        self.calm = False                    # "Reduce flashing": gentler alerts
+        self.balance = (1.0, 1.0, 1.0)       # per-channel gain, fixes a tinted "white"
         t = threading.Thread(target=self._run_loop, daemon=True)
         t.start()
 
@@ -903,35 +968,58 @@ class BleWorker:
             self._set_connected(False)
         await self._connect(fx=True)
 
-    async def _alert(self, kind, brightness, max_s=CALL_MAX_S):
-        """Play a notification ("notify") or call ("call") alert over whatever is
-        running, then put the strip back as it was: replay the latest frame of each
-        kind in send order (so off stays off, an effect resumes), then any frames
-        that sync/audio/effects queued meanwhile."""
-        if kind == "notify" and self._alert_on:
-            return                           # something is already flashing
+    async def _alert(self, kind, brightness, max_s=CALL_MAX_S, color=None):
+        """Play an alert over whatever is running, then put the strip back as it was:
+        replay the latest frame of each kind in send order (so off stays off, an effect
+        resumes), then any frames that sync/audio/effects queued meanwhile.
+        kinds: "notify" / "flash" (pulses; flash takes a color), "call" (green swell until
+        cancelled), "onair" (steady red while onair_on stays True)."""
+        if kind in ("notify", "flash") and self._alert_on:
+            return                           # something is already showing
+        if kind == "call" and self._alert_on and self._alert_kind == "onair":
+            return                           # you're on air: a ringing call doesn't override it
+        if kind == "onair" and self._alert_on and self._alert_kind == "onair":
+            return
         if not self._connected():
             return                           # never start a connect just to flash
         async with self._alert_lock:         # a call waits for a notify to finish
-            self._alert_on, self.alert_cancel = True, False
+            if kind == "onair" and not self.onair_on:
+                return                       # it ended while we waited: don't blip the strip
+            self._alert_on, self._alert_kind = True, kind
+            if kind != "onair":
+                self.alert_cancel = False
             s = max(brightness, 50) / 100.0  # visible even at a dim brightness
+            step = 0.5 if kind == "onair" else SEND_INTERVAL   # steady red needs few writes
             try:
                 await self._write(cmd_on(), track=False)
                 t = 0.0
-                while not self.alert_cancel and t < max_s:
-                    rgb = alert_frame(kind, t)
+                while t < max_s and (self.onair_on if kind == "onair" else not self.alert_cancel):
+                    rgb = alert_frame(kind, t, color, self.calm)
                     if rgb is None:
                         break
                     await self._write(cmd_color(*(int(c * s) for c in rgb)), track=False)
-                    await asyncio.sleep(SEND_INTERVAL)
-                    t += SEND_INTERVAL
+                    await asyncio.sleep(step)
+                    t += step
             finally:
                 for payload in list(self._last.values()):
                     await self._write(payload, track=False)
-                self._alert_on = False
+                self._alert_on, self._alert_kind = False, None
                 held, self._held = self._held, {}
                 for channel, payload in held.items():
                     self._set_pending(channel, payload)
+
+    def last_color(self):
+        """(r, g, b) of the last color frame sent (before color balance), or None."""
+        p = self._last.get(b"\x05")
+        return (p[4], p[5], p[6]) if p and len(p) == 9 and p[3] == 0x03 else None
+
+    def _calibrated(self, payload):
+        """Apply the strip's color balance to a color frame (others pass through)."""
+        if len(payload) == 9 and payload[2] == 0x05 and payload[3] == 0x03 \
+                and self.balance != (1.0, 1.0, 1.0):
+            r, g, b = apply_balance(tuple(payload[4:7]), self.balance)
+            return payload[:4] + bytes((r, g, b)) + payload[7:]
+        return payload
 
     async def _open(self, target):
         """Connect to a BLEDevice or a raw address string. Returns True on success.
@@ -1085,7 +1173,8 @@ class BleWorker:
             await self._connect()
         if self._connected():
             try:
-                await self.client.write_gatt_char(self.write_uuid, payload, response=False)
+                await self.client.write_gatt_char(self.write_uuid, self._calibrated(payload),
+                                                  response=False)
                 if track:                    # remember the strip's state for alert restore
                     kind = payload[2:3]      # frame type: power / color / effect / speed
                     self._last.pop(kind, None)
@@ -1110,6 +1199,9 @@ class ScreenSync:
         self.dark_mode = "Dim"              # "Dim" | "Glow" | "Keep"
         self.sat = SYNC_STYLES["Balanced"][0]  # live saturation factor (Style sets it)
         self.alpha = 0.30                   # smoothing: higher = snappier
+        self.area = "Whole screen"          # which part of the screen to sample
+        self.crop_bars = True               # ignore letterbox / pillarbox black bars
+        self.calm = False                   # "Reduce flashing": cap how fast it can react
         # Capture a bit above the BLE send rate (~12.5/s) so each send uses a
         # fresh frame; the writer coalesces and drops any extras. No point
         # capturing faster than the strip can display.
@@ -1151,16 +1243,15 @@ class ScreenSync:
         brightness multiplier the caller applies (used by the 'Dim' dark mode)."""
         _sat0, gamma, center = SYNC_STYLES.get(self.style, SYNC_STYLES["Balanced"])
         sat = self.sat                      # live-tunable, overrides the style's sat
-        h, w = arr.shape[:2]
+        region = crop_black_bars(arr) if self.crop_bars else arr
+        h, w = region.shape[:2]
         if center:
             # sample the central 60% for a punchier dominant color
             y0, y1 = int(h * 0.2), int(h * 0.8)
             x0, x1 = int(w * 0.2), int(w * 0.8)
-            region = arr[y0:y1, x0:x1]
-        else:
-            region = arr
-        # subsample for speed; BGR float
-        sub = region[::8, ::8, :3].astype(np.float32)
+            region = region[y0:y1, x0:x1]
+        # subsample for speed, then keep only the chosen part of the screen; BGR float
+        sub = select_area(region[::8, ::8, :3], self.area).astype(np.float32)
         b_ch, g_ch, r_ch = sub[..., 0], sub[..., 1], sub[..., 2]
 
         if self.extract_mode == "Dominant":
@@ -1205,11 +1296,12 @@ class ScreenSync:
                 self._last_bright = rgb.copy()
         # "Keep" -> raw color, level stays 1.0
 
-        # temporal smoothing (anti-strobe)
+        # temporal smoothing (anti-strobe); "Reduce flashing" caps how snappy it can be
+        alpha = min(self.alpha, 0.25) if self.calm else self.alpha
         if self._prev is None:
             self._prev = rgb
         else:
-            self._prev = self._prev * (1 - self.alpha) + rgb * self.alpha
+            self._prev = self._prev * (1 - alpha) + rgb * alpha
         out = np.clip(self._prev, 0, 255).astype(int)
         return int(out[0]), int(out[1]), int(out[2]), level
 
@@ -1296,6 +1388,8 @@ class AudioReactive:
         self.get_brightness, self.get_base_color = get_brightness, get_base_color
         self.stopped_cb = stopped_cb        # called (from the thread) when capture ends
         self.mode = "Pulse"
+        self.calm = False                   # "Reduce flashing": soften beat flashes
+        self._limiter = FlashLimiter(0.3)
         self.source = SYSTEM_AUDIO          # or a microphone name
         self.sensitivity = 50               # 1..100
         self.smoothing = 40                 # 0..100 -> release 0.05..1.0 s
@@ -1405,7 +1499,12 @@ class AudioReactive:
                             self.last_beat = time.perf_counter()
                         s = self.get_brightness() / 100.0 * lvl
                         r, g, b = rgb
-                        self.ble.queue("color", cmd_color(int(r * s), int(g * s), int(b * s)))
+                        frame = (int(r * s), int(g * s), int(b * s))
+                        if self.calm:
+                            frame = self._limiter.step(frame, dt)
+                        else:
+                            self._limiter.reset()
+                        self.ble.queue("color", cmd_color(*frame))
                         now = time.perf_counter()
                         if now - last_ui > SEND_INTERVAL:   # UI tint at the strip's rate
                             last_ui = now
@@ -1489,9 +1588,53 @@ class NotificationWatcher:
             await asyncio.sleep(1.0)
 
 
+class Tooltip:
+    """A hover bubble: appears after a short pause beside the widget, hides when the
+    pointer leaves or you click."""
+    def __init__(self, widget, text, wrap=270):
+        self.widget, self.text, self.wrap = widget, text, wrap
+        self._tip, self._job = None, None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _e=None):
+        self._hide()
+        self._job = self.widget.after(250, self._show)
+
+    def _hide(self, _e=None):
+        if self._job is not None:
+            self.widget.after_cancel(self._job)
+            self._job = None
+        if self._tip is not None:
+            self._tip.destroy()
+            self._tip = None
+
+    def _show(self):
+        self._job = None
+        w = self.widget
+        tip = tk.Toplevel(w)
+        tip.wm_overrideredirect(True)
+        tip.attributes("-topmost", True)
+        border = tk.Frame(tip, bg=LINE, padx=1, pady=1)
+        border.pack()
+        tk.Label(border, text=self.text, justify="left", wraplength=self.wrap, bg=PANEL2,
+                 fg=TEXT, font=FONT_BODY, padx=10, pady=8).pack()
+        tip.update_idletasks()
+        x = w.winfo_rootx() + 12
+        x = max(8, min(x, w.winfo_screenwidth() - tip.winfo_reqwidth() - 8))
+        y = w.winfo_rooty() + w.winfo_height() + 6
+        if y + tip.winfo_reqheight() > w.winfo_screenheight() - 8:   # no room below: go above
+            y = w.winfo_rooty() - tip.winfo_reqheight() - 6
+        tip.wm_geometry(f"+{x}+{y}")
+        self._tip = tip
+
+
 class App:
     def __init__(self, root, lock=None):
         self.root = root
+        self._wheel_targets = {}            # tab path -> canvas the mouse wheel should scroll
+        root.bind_all("<MouseWheel>", self._on_wheel)
         self.ble = BleWorker(self.set_status, self.set_connected)
         cfg = load_settings()
         self._saved = cfg                   # last state written to disk
@@ -1528,6 +1671,22 @@ class App:
         self.notifier = NotificationWatcher(
             self._on_notification, lambda: setattr(self.ble, "alert_cancel", True),
             self.set_status)
+
+        # comfort: fades, reduce flashing, strip color balance
+        self.fade_name = cfg["fade"]
+        self.reduce_flash = cfg["reduce_flash"]
+        self.balance_pct = [cfg["bal_r"], cfg["bal_g"], cfg["bal_b"]]
+        self.light_on = True                # what we last told the strip (for the on/off hotkey)
+        self._fade_job = None               # pending root.after id of the running fade
+        self._limiter = FlashLimiter()      # soft effects, when reducing flashing
+        self._fx_limiters = {}              # one per preview tile, same reason
+        self.sync.area, self.sync.crop_bars = cfg["area"], cfg["crop_bars"]
+        self._apply_comfort()
+        self.ui = SimpleNamespace(           # what rgbzap_tools needs to draw in our style
+            INK=INK, PANEL=PANEL, PANEL2=PANEL2, LINE=LINE, TEXT=TEXT, MUTE=MUTE, GOOD=GOOD,
+            BAD=BAD, SYNC_BLUE=SYNC_BLUE, FONT_BODY=FONT_BODY, FONT_MONO=FONT_MONO,
+            FONT_EYE=FONT_EYE, FONT_BTN=FONT_BTN, HOTKEY_ACTIONS=HOTKEY_ACTIONS,
+            ONAIR_MAX_S=ONAIR_MAX_S, APP_VERSION=APP_VERSION)
 
         root.title("RGBZap — LED Console")
         root.configure(bg=INK, padx=14, pady=14)
@@ -1579,6 +1738,7 @@ class App:
         fx = self.fx_tab = self._tab(nb, "EFFECTS")
         screen = self._tab(nb, "SCREEN")
         audio = self._tab(nb, "AUDIO")
+        tools = self._tab(nb, "TOOLS", scroll=True)
         system = self._tab(nb, "SYSTEM")
         self._build_tabbar()
 
@@ -1621,7 +1781,7 @@ class App:
 
         pw = tk.Frame(light, bg=PANEL)
         pw.pack(fill="x", pady=(12, 0))
-        self._flat(pw, "Turn on", lambda: self.send(cmd_on()), bg=GOOD, fg=INK,
+        self._flat(pw, "Turn on", self.on_on, bg=GOOD, fg=INK,
                    hover="#5FE3B4").pack(side="left", expand=True, fill="x", padx=(0, 5))
         self._flat(pw, "Turn off", self.on_off, bg=PANEL2, fg=TEXT,
                    hover=LINE).pack(side="left", expand=True, fill="x")
@@ -1666,9 +1826,7 @@ class App:
         sb.pack(side="right", fill="y", padx=(6, 0))
         self.fx_canvas.pack(side="left", fill="both", expand=True)
         self.fx_canvas.bind("<Configure>", self._fx_layout)
-        self.fx_canvas.bind("<Enter>", lambda _e: self.fx_canvas.bind_all(
-            "<MouseWheel>", lambda e: self.fx_canvas.yview_scroll(int(-e.delta / 120), "units")))
-        self.fx_canvas.bind("<Leave>", lambda _e: self.fx_canvas.unbind_all("<MouseWheel>"))
+        self._wheel_targets[str(self.fx_tab)] = self.fx_canvas   # shared mouse-wheel handler
         self._fx_tiles = {}                  # effect name (None = no effect) -> canvas items
         self._fx_w = 0
         self._fx_shown = {}                  # tile -> last drawn color (skip no-op redraws)
@@ -1704,8 +1862,28 @@ class App:
         self._field(grid, 1, "Extract", self.extract_var, ["Dominant", "Average"],
                     lambda e: setattr(self.sync, "extract_mode", self.extract_var.get()))
         self._field(grid, 2, "Dark scenes", self.dark_var, ["Dim", "Glow", "Keep"],
-                    lambda e: setattr(self.sync, "dark_mode", self.dark_var.get()))
+                    lambda e: setattr(self.sync, "dark_mode", self.dark_var.get()),
+                    help="What the strip does when the picture goes dark. Dim keeps the "
+                         "scene's color but lowers the light; Glow holds a faint glow of "
+                         "the last bright color; Keep shows the raw color.")
+        self.area_var = tk.StringVar(value=cfg["area"])
+        self._field(grid, 3, "Sample from", self.area_var, list(AREAS), self.on_area_change,
+                    help="Which part of the screen the strip copies. Whole screen is the "
+                         "classic Ambilight look. Edges ignores the middle and matches the "
+                         "border, which suits bias lighting behind a monitor. Left, Right, "
+                         "Top or Bottom follow just that side.")
         grid.columnconfigure(1, weight=1)
+        self.bars_var = tk.BooleanVar(value=cfg["crop_bars"])
+        bars = tk.Frame(screen, bg=PANEL)
+        bars.pack(fill="x", pady=(4, 0))
+        tk.Checkbutton(bars, text="Ignore black bars", variable=self.bars_var,
+                       command=self.on_bars_toggle, anchor="w", font=FONT_BODY, fg=TEXT,
+                       bg=PANEL, selectcolor=PANEL2, activebackground=PANEL,
+                       activeforeground=TEXT, highlightthickness=0, bd=0).pack(side="left")
+        self._help(bars, "Widescreen films have black bars above and below the picture. "
+                         "With this on, RGBZap skips them, so the strip matches the picture "
+                         "instead of looking dark. It never crops more than 15% from a side."
+                   ).pack(side="left", padx=(6, 0))
 
         self._eyebrow(screen, "Saturation").pack(fill="x", pady=(14, 2))
         self.sat_scale = self._gauge(screen, 100, 250, self.on_sat, cfg["sat"], "%")
@@ -1802,6 +1980,35 @@ class App:
                      font=FONT_BODY, fg=MUTE, bg=PANEL, anchor="w").pack(fill="x", pady=(6, 0))
         self.on_notify_toggle()
 
+        self._heading(system, "Comfort", pady=(16, 4))
+        fr = tk.Frame(system, bg=PANEL)
+        fr.pack(fill="x")
+        tk.Label(fr, text="Fade between colors", font=FONT_BODY, fg=MUTE, bg=PANEL
+                 ).pack(side="left")
+        self.fade_var = tk.StringVar(value=self.fade_name)
+        self._combo(fr, self.fade_var, list(FADES), 9, self.on_fade_change
+                    ).pack(side="left", padx=(10, 0))
+        self._help(fr, "How colors blend when you pick a new color, apply a scene, or "
+                       "turn the lights on or off, instead of snapping. Quick is 0.3 s, "
+                       "Smooth 0.7 s, Slow 1.5 s. It doesn't slow down effects, screen "
+                       "sync or the brightness slider."
+                   ).pack(side="left", padx=(8, 0))
+        self.calm_var = tk.BooleanVar(value=self.reduce_flash)
+        rf = tk.Frame(system, bg=PANEL)
+        rf.pack(fill="x", pady=(6, 0))
+        tk.Checkbutton(rf, text="Reduce flashing", variable=self.calm_var,
+                       command=self.on_calm_toggle, anchor="w", font=FONT_BODY, fg=TEXT,
+                       bg=PANEL, selectcolor=PANEL2, activebackground=PANEL,
+                       activeforeground=TEXT, highlightthickness=0, bd=0).pack(side="left")
+        self._help(rf, "Makes the lights gentler for people sensitive to flashing. Fast "
+                       "effects (Lightning, Police, Party, Neon flicker, Fireworks), "
+                       "notification flashes, beat flashes and screen-sync cuts are "
+                       "smoothed so nothing flashes more than a few times a second. The "
+                       "strip's own Blink and Jump effects are switched off, because they "
+                       "run inside the strip where RGBZap can't soften them. Also applies "
+                       "to the effect previews on screen."
+                   ).pack(side="left", padx=(6, 0))
+
         self._eyebrow(system, "Updates").pack(fill="x", pady=(16, 4))
         self.update_var = tk.BooleanVar(value=self.update_check)
         self._check(system, "Check for updates automatically", self.update_var,
@@ -1824,6 +2031,9 @@ class App:
         tk.Label(by, text="· Free and open source (MIT)", font=FONT_BODY, fg=TEXT, bg=PANEL
                  ).pack(side="left")
         self._link(about, APP_URL.removeprefix("https://"), APP_URL).pack(anchor="w")
+
+        # ---- TOOLS tab: hotkeys, On-Air light, OBS link, local control, color balance
+        self.tools = rgbzap_tools.ToolsTab(self, tools, cfg)
 
         # lock a consistent width; let height be resized (min keeps it usable)
         root.update_idletasks()
@@ -1849,6 +2059,7 @@ class App:
         resume = (cfg["effect"], cfg["speed"]) if self.mode == "effect" else None
         self.ble.submit(self._launch(resume))
         self.root.after(2000, self._autosave)
+        self.tools.start()                    # hotkeys, On-Air watcher, OBS link, local API
         if self.update_check:                 # first look a few seconds after launch
             self._schedule_update_check(5000)
 
@@ -1936,6 +2147,11 @@ class App:
             "strips": [list(s) for s in self.strips],
             "notify_flash": self.notify_flash, "notify_call": self.notify_call,
             "update_check": self.update_check,
+            "fade": self.fade_name, "reduce_flash": self.reduce_flash,
+            "area": self.sync.area, "crop_bars": self.sync.crop_bars,
+            "bal_r": self.balance_pct[0], "bal_g": self.balance_pct[1],
+            "bal_b": self.balance_pct[2],
+            **self.tools.snapshot(),
             "audio_mode": self.audio.mode, "audio_source": self.audio.source,
             "audio_sens": self.audio.sensitivity, "audio_smooth": self.audio.smoothing,
             "audio_floor": self.audio.floor,
@@ -1961,8 +2177,9 @@ class App:
         self.root.after(2000, self._autosave)
 
     def _fx_params(self):
-        if self.sync.running or self.audio.running:
-            return None                      # don't hijack an active sync
+        if self.sync.running or self.audio.running or self.reduce_flash:
+            return None                      # don't hijack a sync; the ripple bounces: skip it
+                                             # when reducing flashing
         return self.base_color, self.brightness
 
     # ---- theme + widget factories ----
@@ -2000,14 +2217,62 @@ class App:
         root.option_add("*TCombobox*Listbox.selectForeground", TEXT)
         root.option_add("*TCombobox*Listbox.font", FONT_BODY)
 
-    def _tab(self, nb, title):
-        f = tk.Frame(nb, bg=PANEL, padx=16, pady=16)
-        nb.add(f, text=title)
-        return f
+    def _tab(self, nb, title, scroll=False):
+        """A tab page. scroll=True wraps it in a scrollable canvas (for tall pages) and
+        returns the inner frame to fill."""
+        if not scroll:
+            f = tk.Frame(nb, bg=PANEL, padx=16, pady=16)
+            nb.add(f, text=title)
+            return f
+        outer = tk.Frame(nb, bg=PANEL)
+        nb.add(outer, text=title)
+        canvas = tk.Canvas(outer, bg=PANEL, highlightthickness=0, bd=0, height=420)
+        sb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview,
+                           style="RGBZap.Vertical.TScrollbar")
+        inner = tk.Frame(canvas, bg=PANEL, padx=16, pady=16)
+        win = canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y", padx=(0, 4), pady=8)
+        canvas.pack(side="left", fill="both", expand=True)
+        inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win, width=e.width))
+        self._wheel_targets[str(outer)] = canvas
+        return inner
+
+    def _on_wheel(self, e):
+        """One mouse-wheel handler for every scrollable tab: scrolls the selected one."""
+        try:
+            canvas = self._wheel_targets.get(self.nb.select())
+        except tk.TclError:
+            return
+        if canvas is not None:
+            canvas.yview_scroll(int(-e.delta / 120), "units")
 
     def _eyebrow(self, parent, text):
         return tk.Label(parent, text=text.upper(), font=FONT_EYE, fg=MUTE, bg=PANEL,
                         anchor="w")
+
+    def _help(self, parent, text):
+        """A small round "?" that explains itself on hover."""
+        c = tk.Canvas(parent, width=16, height=16, bg=PANEL, highlightthickness=0,
+                      cursor="question_arrow")
+        ring = c.create_oval(1, 1, 15, 15, outline=MUTE)
+        mark = c.create_text(8, 8, text="?", fill=MUTE, font=("Segoe UI Semibold", 8))
+        c.bind("<Enter>", lambda _e: (c.itemconfig(ring, outline=TEXT),
+                                      c.itemconfig(mark, fill=TEXT)), add="+")
+        c.bind("<Leave>", lambda _e: (c.itemconfig(ring, outline=MUTE),
+                                      c.itemconfig(mark, fill=MUTE)), add="+")
+        Tooltip(c, text)
+        return c
+
+    def _heading(self, parent, text, help=None, pady=(14, 4)):
+        """Section heading, optionally with a "?" help icon beside it."""
+        row = tk.Frame(parent, bg=PANEL)
+        row.pack(fill="x", pady=pady)
+        self._eyebrow(row, text).pack(side="left")
+        if help:
+            self._help(row, help).pack(side="left", padx=(6, 0))
+        return row
 
     def _flat(self, parent, text, cmd, bg=PANEL2, fg=TEXT, hover=LINE, pady=8,
               hoverable=True):
@@ -2064,11 +2329,13 @@ class App:
             cb.bind("<<ComboboxSelected>>", cmd)
         return cb
 
-    def _field(self, grid, row, label, var, values, cmd):
+    def _field(self, grid, row, label, var, values, cmd, help=None):
         tk.Label(grid, text=label, font=FONT_BODY, fg=MUTE, bg=PANEL, anchor="w"
                  ).grid(row=row, column=0, sticky="w", pady=4, padx=(0, 10))
         self._combo(grid, var, values, 14, cmd).grid(row=row, column=1, sticky="ew",
                                                       pady=4)
+        if help:
+            self._help(grid, help).grid(row=row, column=2, padx=(8, 0))
 
     # ---- thread-safe UI updates ----
     def set_status(self, text):
@@ -2085,16 +2352,83 @@ class App:
                 self._remember_strip(self._found_names.get(addr, "Light strip"), addr)
                 self._refresh_strips(addr)
             self._draw_link()
+            if state and getattr(self, "tools", None) is not None:
+                self.tools.on_strip_connected()      # re-light On-Air if it's already on air
         self.root.after(0, _apply)
 
     def send(self, payload):
         self.ble.submit(self.ble._write(payload))
 
-    def _apply_current_color(self):
+    def _apply_current_color(self, fade=False):
+        """Send the steady color. fade=True blends from what the strip shows now (a
+        discrete change: a chip, a scene, Effect off); sliders and live drags pass
+        False so they stay instant."""
         r, g, b = self.base_color
         s = self.brightness / 100.0
+        target = (int(r * s), int(g * s), int(b * s))
+        self._cancel_fade()
+        ms = FADES.get(self.fade_name, 0)
+        if (fade and ms and not (self.sync.running or self.audio.running
+                                 or self.soft is not None)):
+            begin = self.ble.last_color()
+            if begin is not None and begin != target:
+                self._run_fade(fade_steps(begin, target, max(1, round(ms / (SEND_INTERVAL * 1000)))))
+                return
         # coalesced channel: rapid slider drags collapse to the latest color
-        self.ble.queue("color", cmd_color(int(r * s), int(g * s), int(b * s)))
+        self.ble.queue("color", cmd_color(*target))
+
+    def _run_fade(self, steps, done=None, i=0):
+        """One fade step per strip update, on the Tk thread (the writer coalesces)."""
+        if self.sync.running or self.audio.running or self.soft is not None:
+            self._fade_job = None             # something else took over the strip
+            return
+        if i >= len(steps):
+            self._fade_job = None
+            if done:
+                done()
+            return
+        self.ble.queue("color", cmd_color(*steps[i]))
+        self._fade_job = self.root.after(int(SEND_INTERVAL * 1000), self._run_fade,
+                                         steps, done, i + 1)
+
+    def _cancel_fade(self):
+        if self._fade_job is not None:
+            self.root.after_cancel(self._fade_job)
+            self._fade_job = None
+
+    def _apply_comfort(self):
+        """Push the reduce-flashing flag and the color balance to the parts that use them."""
+        self.sync.calm = self.audio.calm = self.ble.calm = self.reduce_flash
+        self.ble.balance = tuple(p / 100.0 for p in self.balance_pct)
+
+    def on_fade_change(self, _evt=None):
+        self.fade_name = self.fade_var.get()
+
+    def on_calm_toggle(self):
+        self.reduce_flash = self.calm_var.get()
+        self._apply_comfort()
+        self._limiter.reset()
+        self._fx_limiters.clear()
+        self._fx_relayout()                   # marks / unmarks the strip's blink + jump tiles
+        if self.reduce_flash:
+            name = self.effect_var.get()
+            if self.mode == "effect" and self._flashing_builtin(name):
+                self.on_effect_off()          # one of those is running: stop it
+            self.set_status("Reduce flashing is on")
+        else:
+            self.set_status("Reduce flashing is off")
+
+    @staticmethod
+    def _flashing_builtin(name):
+        """The strip's own Blink / Jump effects run inside the strip, so RGBZap can't
+        soften them: Reduce flashing switches them off."""
+        return name in EFFECTS and name.startswith(("Blink ", "Jump "))
+
+    def on_area_change(self, _evt=None):
+        self.sync.area = self.area_var.get()
+
+    def on_bars_toggle(self):
+        self.sync.crop_bars = self.bars_var.get()
 
     def _paint(self, rgb):
         """Tint the live-color UI (swatch, aura bar, hex readout) to rgb."""
@@ -2189,14 +2523,15 @@ class App:
         if i != self.nb.index("current"):
             self.tabbar.itemconfig(self._tab_labels[i][0], fill="#B4BFD0" if on else MUTE)
 
-    def set_color(self, rgb):
+    def set_color(self, rgb, fade=True):
         self.base_color = rgb
         if getattr(self.soft, "PICKS_COLOR", False):
             self._stop_soft()                 # Rainbow etc. ignore color: the pick wins
         if self.soft is None:              # a brightness-only effect keeps going, new color
             self.mode = "color"
+        self.light_on = True
         self._paint(rgb)
-        self._apply_current_color()
+        self._apply_current_color(fade=fade)
         if getattr(self, "_tray", None) is not None:   # tray dot follows the color
             self._tray.icon = self._tray_image(rgb)
 
@@ -2360,12 +2695,12 @@ class App:
             place(x, y)
             # set_color queues on the coalescing "color" slot: a fast drag sends
             # only the newest color at the strip's real rate — live, never laggy
-            self.set_color(hs_rgb(x / (W - 1), 1 - y / (H - 1)))
+            self.set_color(hs_rgb(x / (W - 1), 1 - y / (H - 1)), fade=False)
         cv.bind("<Button-1>", pick)
         cv.bind("<B1-Motion>", pick)
 
         def cancel():
-            self.set_color(orig)
+            self.set_color(orig, fade=False)
             top.destroy()
 
         def save():
@@ -2387,13 +2722,21 @@ class App:
 
     def on_effect(self):
         name = self.effect_var.get()
+        if self.reduce_flash and self._flashing_builtin(name):
+            self.on_effect_off()
+            self.set_status(f"{name} is off while Reduce flashing is on")
+            return
         self.mode = "effect"
+        self.light_on = True
         if name in SOFT_EFFECTS:
+            self._cancel_fade()
             self._start_soft(name)
             return
         self._stop_soft()
+        self._cancel_fade()
         self._stop_sync()                     # sync frames would overwrite the effect
         self._stop_audio()
+        self.ble._last.pop(b"\x05", None)     # the strip's color is no longer what we sent
         # same "color" slot as the flame frames, so a pending one can't land after
         # this and freeze the strip on a static color
         self.ble.queue("color", cmd_effect(EFFECTS[name]))
@@ -2450,7 +2793,9 @@ class App:
                 else:
                     face = self._rrect(c, x0, y0, x0 + tw, y0 + th, 8, fill=PANEL2,
                                        outline=LINE, tags=tag)
-                text = c.create_text(x0 + tw / 2, y0 + th + 12, text=label, fill=MUTE,
+                locked = self.reduce_flash and name is not None and self._flashing_builtin(name)
+                text = c.create_text(x0 + tw / 2, y0 + th + 12,
+                                     text=label + " ⚠" if locked else label, fill=MUTE,
                                      font=("Segoe UI", 8), tags=tag)
                 self._fx_tiles[name] = (ring, glow, face, text)
                 c.tag_bind(tag, "<Button-1>", lambda _e, n=name: self.on_fx_pick(n))
@@ -2462,9 +2807,19 @@ class App:
         c.config(scrollregion=(0, -6, w, y))
         self._fx_render()
 
+    def _fx_relayout(self):
+        """Rebuild the tile grid now (e.g. after Reduce flashing changes which tiles lock)."""
+        self._fx_w = 0
+        w = self.fx_canvas.winfo_width()
+        if w > 1:
+            self._fx_layout(SimpleNamespace(width=w))
+
     def on_fx_pick(self, name):
         if name is None:
             self.on_effect_off()
+        elif self.reduce_flash and self._flashing_builtin(name):
+            self.set_status(f"{name} is off while Reduce flashing is on (System > Comfort)")
+            return
         else:
             self.effect_var.set(name)
             self.on_effect()
@@ -2488,9 +2843,14 @@ class App:
             out = prev.step(0.08, speed)
             if not isinstance(out, tuple):      # level effect: shown on the user's color
                 out = tuple(int(c * out) for c in self.base_color)
+            if self.reduce_flash:               # previews flash on screen too: smooth them
+                out = self._fx_limiters.setdefault(name, FlashLimiter()).step(out, 0.08)
             self._fx_paint(name, out)
         for name in EFFECTS:
-            self._fx_paint(name, builtin_preview(name, self._fx_t))
+            if self.reduce_flash and self._flashing_builtin(name):
+                self._fx_paint(name, (34, 38, 48))      # locked: a still, dim tile
+            else:
+                self._fx_paint(name, builtin_preview(name, self._fx_t))
         self._fx_render()
 
     def _fx_paint(self, name, rgb):
@@ -2579,20 +2939,113 @@ class App:
         self._stop_soft()
         self._stop_audio()
         self.mode = "color"
-        self._apply_current_color()          # a color frame ends built-in effects too
+        self._apply_current_color(fade=True)  # a color frame ends built-in effects too
         self.set_status("Effect off")
+
+    def on_on(self):
+        """Turn the lights on; if they were faded out, fade back up to the color."""
+        self.light_on = True
+        self.send(cmd_on())
+        if self.mode == "color" and not (self.sync.running or self.audio.running):
+            self._apply_current_color(fade=True)
 
     def on_off(self):
         self._stop_soft()
         self._stop_sync()
         self._stop_audio()
-        self.ble.queue("color", cmd_off())
+        self._cancel_fade()
+        self.light_on = False
+        ms, cur = FADES.get(self.fade_name, 0), self.ble.last_color()
+        if ms and cur is not None and cur != (0, 0, 0):   # fade out, then switch off
+            self._run_fade(fade_steps(cur, (0, 0, 0), max(1, round(ms / (SEND_INTERVAL * 1000)))),
+                           done=lambda: self.ble.queue("color", cmd_off()))
+        else:
+            self.ble.queue("color", cmd_off())
+
+    # ---- one control surface for hotkeys, the local API and OBS (Tk thread only) ----
+    def toggle_power(self):
+        self.on_on() if not self.light_on else self.on_off()
+
+    def step_brightness(self, delta):
+        v = max(1, min(100, int(round(float(self.bright.get()))) + delta))
+        self.bright.set(v)                    # fires on_brightness
+        self.set_status(f"Brightness {v}%")
+
+    def set_brightness_value(self, v):
+        self.bright.set(max(1, min(100, int(v))))
+
+    def cycle_scene(self, step):
+        names = list(self.scenes)
+        if not names:
+            self.set_status("No scenes saved yet")
+            return
+        cur = self.scene_var.get()
+        i = (names.index(cur) + step) % len(names) if cur in names else (0 if step > 0 else -1)
+        self.apply_scene(names[i])
+
+    def set_effect(self, name):
+        """Start the named effect, or stop effects with None."""
+        if name is None:
+            self.on_effect_off()
+        else:
+            self.effect_var.set(name)
+            self.on_effect()
+            self._fx_render()
+
+    def set_sync(self, on):
+        """on: True / False / 'toggle'"""
+        want = (not self.sync.running) if on == "toggle" else bool(on)
+        if want != self.sync.running:
+            self.on_toggle_sync()
+
+    def set_audio(self, on):
+        want = (not self.audio.running) if on == "toggle" else bool(on)
+        if want != self.audio.running:
+            self.on_toggle_audio()
+
+    def flash(self, rgb):
+        """A short alert flash in rgb, then back to what the strip was showing."""
+        if self.ble._connected():
+            self.ble.submit(self.ble._alert("flash", self.brightness, color=tuple(rgb)))
+
+    def effect_names(self):
+        return list(SOFT_EFFECTS) + list(EFFECTS)
+
+    def set_balance(self, idx, pct):
+        """Strip color balance: gain per channel in percent (100 = untouched)."""
+        self.balance_pct[idx] = int(pct)
+        self._apply_comfort()
+        if self.mode == "color" and self.soft is None and not (self.sync.running
+                                                               or self.audio.running):
+            self._apply_current_color()       # show the change right away
+
+    def status_info(self):
+        r, g, b = self.base_color
+        return {"version": APP_VERSION, "connected": self.ble._connected(),
+                "power": "on" if self.light_on else "off",
+                "color": "#%02X%02X%02X" % (r, g, b), "brightness": self.brightness,
+                "mode": self.mode, "effect": self.effect_var.get() if self.mode == "effect" else None,
+                "scene": self.scene_var.get() or None, "sync": self.sync.running,
+                "audio": self.audio.running}
+
+    def run_hotkey(self, action):
+        """A global hotkey fired (already on the Tk thread)."""
+        {"toggle_power": self.toggle_power,
+         "brightness_up": lambda: self.step_brightness(+10),
+         "brightness_down": lambda: self.step_brightness(-10),
+         "toggle_sync": lambda: self.set_sync("toggle"),
+         "toggle_audio": lambda: self.set_audio("toggle"),
+         "next_scene": lambda: self.cycle_scene(+1),
+         "prev_scene": lambda: self.cycle_scene(-1),
+         "effect_off": self.on_effect_off}.get(action, lambda: None)()
 
     # ---- software effects (SOFT_EFFECTS: flames, Breathe, Rainbow, ...) ----
     def _start_soft(self, name):
         self._stop_sync()
         self._stop_audio()
+        self.light_on = True
         self.send(cmd_on())
+        self._limiter.reset()
         self.soft = SOFT_EFFECTS[name]()
         self.set_status(f"{name} effect ON")
         if self._soft_job is None:
@@ -2616,7 +3069,10 @@ class App:
         else:                                 # brightness-only effect on the user's color
             r, g, b = self.base_color
             s *= out
-        self.ble.queue("color", cmd_color(int(r * s), int(g * s), int(b * s)))
+        frame = (int(r * s), int(g * s), int(b * s))
+        if self.reduce_flash:                 # soften fast flashing before it reaches the strip
+            frame = self._limiter.step(frame, SEND_INTERVAL)
+        self.ble.queue("color", cmd_color(*frame))
         self._soft_job = self.root.after(int(SEND_INTERVAL * 1000), self._soft_tick)
 
     def on_speed(self, val):
@@ -2690,6 +3146,7 @@ class App:
                 return
             self._stop_soft()
             self._stop_audio()
+            self.light_on = True
             self.send(cmd_on())          # make sure the strip is on
             self.sync.start()
             self.sync_btn.config(text="■  Stop screen sync", bg=BAD, fg=INK,
@@ -2721,6 +3178,7 @@ class App:
             return
         self._stop_sync()
         self._stop_soft()
+        self.light_on = True
         self.send(cmd_on())
         self.audio.start()
         self.audio_btn.config(text="■  Stop audio reactive", bg=BAD, fg=INK,
@@ -2827,7 +3285,7 @@ class App:
                  if self.update_info else "Update available",
                  act(self.open_update), visible=lambda _i: bool(self.update_info)),
             Menu.SEPARATOR,
-            Item("Turn on", act(lambda: self.send(cmd_on()))),
+            Item("Turn on", act(self.on_on)),
             Item("Turn off", act(self.on_off)),
             Item("Scenes", Menu(scenes)),                 # rebuilt on open: saves show at once
             Item("Colors", Menu(colors)),                 # rebuilt on open: custom stays current
@@ -2837,6 +3295,8 @@ class App:
                  checked=lambda _i: self.sync.running),
             Item("Audio reactive", act(self.on_toggle_audio),
                  checked=lambda _i: self.audio.running),
+            Item("On-Air light", act(self.tools.toggle_onair),
+                 checked=lambda _i: self.tools.onair_enabled),
             Menu.SEPARATOR,
             Item("Quit RGBZap", act(self.quit)),
         )
@@ -2876,6 +3336,7 @@ class App:
         threading.Thread(target=run, daemon=True).start()
 
     def quit(self):
+        self.tools.stop()                     # release hotkeys, close the API port, stop OBS
         if self._tray is not None:
             self._tray.visible = False        # stop() alone leaves a ghost icon on Windows
             self._tray.stop()
@@ -2984,6 +3445,43 @@ def _selftest():
     assert seen == [(RELEASES_API, f"RGBZap/{APP_VERSION}", 8)], seen
     print("OK  update check: numeric compare, public+own-page only, request is one "
           "plain GET, setting defaults on")
+
+    # comfort / tools settings: valid values kept (shortcuts normalized), junk falls back
+    mine = {"fade": "Slow", "reduce_flash": True, "area": "Edges", "crop_bars": False,
+            "bal_r": 90, "bal_g": 80, "bal_b": 100, "hotkeys_on": False,
+            "hotkeys": {"toggle_power": "Alt+Ctrl+Home", "brightness_up": "", "bogus": "ctrl+alt+x"},
+            "onair": True, "onair_mic": True, "obs_on": True, "obs_host": "pc.local",
+            "obs_port": 4456, "obs_password": "pw",
+            "obs_scenes": {"Game": "Focus", "": "x", "Bad": 5}, "api_on": True,
+            "api_port": 50000, "api_token": "a" * 32}
+    with open(p, "w") as f:
+        json.dump(mine, f)
+    got = load_settings(p)
+    assert (got["fade"], got["reduce_flash"], got["area"], got["crop_bars"]) == \
+        ("Slow", True, "Edges", False), got
+    assert (got["bal_r"], got["bal_g"], got["bal_b"]) == (90, 80, 100)
+    assert got["hotkeys"]["toggle_power"] == "ctrl+alt+home" and got["hotkeys"]["brightness_up"] == ""
+    assert set(got["hotkeys"]) == set(HOTKEY_ACTIONS), "unknown actions must not appear"
+    assert got["hotkeys"]["brightness_down"] == DEFAULT_SETTINGS["hotkeys"]["brightness_down"]
+    assert got["obs_scenes"] == {"Game": "Focus"}, got["obs_scenes"]
+    assert (got["obs_host"], got["obs_port"], got["api_port"], got["api_token"]) == \
+        ("pc.local", 4456, 50000, "a" * 32)
+    junk = {"fade": "Warp", "area": "Everywhere", "bal_r": 10, "bal_g": 200, "obs_port": 0,
+            "api_port": 80, "api_token": "not-hex", "hotkeys": {"toggle_power": "a"},
+            "obs_host": "x\n", "obs_scenes": [], "onair": "yes"}
+    with open(p, "w") as f:
+        json.dump(junk, f)
+    got = load_settings(p)
+    for k in ("fade", "area", "bal_r", "bal_g", "obs_port", "api_port", "api_token", "obs_host",
+              "obs_scenes", "onair"):
+        assert got[k] == DEFAULT_SETTINGS[k], (k, got[k])
+    assert got["hotkeys"]["toggle_power"] == DEFAULT_SETTINGS["hotkeys"]["toggle_power"]
+    assert DEFAULT_SETTINGS["api_on"] is False and DEFAULT_SETTINGS["obs_on"] is False
+    assert DEFAULT_SETTINGS["onair"] is False and DEFAULT_SETTINGS["onair_mic"] is False
+    assert not hotkeys.find_conflicts(DEFAULT_SETTINGS["hotkeys"]), "default shortcuts clash"
+    assert all(hotkeys.normalize(c) for c in DEFAULT_SETTINGS["hotkeys"].values() if c)
+    print("OK  settings: comfort/tools values validated; risky features default off; default "
+          "shortcuts valid and distinct")
 
     # picker: the drawn field and the click mapping agree pixel-for-pixel
     W, H = 300, 180
@@ -3124,6 +3622,68 @@ def _selftest():
     cf = [alert_frame("call", i * SEND_INTERVAL) for i in range(100)]
     assert all(ok_out(f) and f[1] >= f[0] for f in cf), "call frames should be green"
     print("OK  alerts: call detection, two-pulse notify, green call swell")
+
+    # alert shapes for the newer kinds: colored flash, calm (single swell), steady on-air red
+    fl = [alert_frame("flash", i * SEND_INTERVAL, (0, 255, 0)) for i in range(20)]
+    assert fl[-1] is None and all(f is None or (f[0] == 0 and f[2] == 0) for f in fl), "flash color"
+    assert any(f and f[1] > 200 for f in fl), "flash should reach full color"
+    calm_n = [alert_frame("notify", i * SEND_INTERVAL, None, True) for i in range(25)]
+    assert calm_n[17] is not None and calm_n[18] is None, "calm notify lasts ~1.4 s"
+    live = [f for f in calm_n if f]
+    peak = max(range(len(live)), key=lambda i: live[i][0])
+    assert all(live[i][0] <= live[i + 1][0] for i in range(peak)) and \
+        all(live[i][0] >= live[i + 1][0] for i in range(peak, len(live) - 1)), \
+        "calm notify should be one smooth swell (up once, down once)"
+    assert alert_frame("onair", 0) == ONAIR_RED == alert_frame("onair", 99999)
+    assert alert_frame("onair", 5, (1, 2, 3)) == (1, 2, 3)
+    print("OK  alerts: colored flash, calm single swell, steady on-air red")
+
+    # reduce flashing, on the real effects: fast ones flash raw, <= 3 per second once softened
+    from rgbzap_comfort import FlashLimiter as _FL, max_flashes_per_second as _mfps
+    for name in ("Police", "Lightning", "Party", "Neon flicker", "Fireworks"):
+        fx = SOFT_EFFECTS[name]()
+        if hasattr(fx, "rng"):
+            fx.rng = random.Random(4)
+        raw = []
+        for _ in range(1500):
+            o = fx.step(SEND_INTERVAL, 100)
+            raw.append(o if isinstance(o, tuple) else (int(255 * o),) * 3)
+        lim = _FL()
+        soft = [lim.step(f, SEND_INTERVAL) for f in raw]
+        assert _mfps(soft, SEND_INTERVAL) <= 3, f"{name} still flashes with Reduce flashing on"
+        assert _mfps(soft, SEND_INTERVAL) <= _mfps(raw, SEND_INTERVAL), f"{name} got worse"
+        if name in ("Police", "Lightning"):
+            assert _mfps(raw, SEND_INTERVAL) >= 3, f"{name} raw should be a flasher"
+    print("OK  reduce flashing: Police / Lightning / Party / Neon / Fireworks stay <= 3 flashes/s")
+
+    # screen sync quality: bars ignored, and the chosen area decides the color
+    film = np.zeros((1080, 1920, 4), dtype=np.uint8)
+    film[..., 3] = 255
+    film[140:940, :, 2] = 200                           # red picture between ~13% black bars
+    ss = ScreenSync(None, lambda *_: None, lambda *_: None, lambda: 100)
+    ss.dark_mode, ss.sat, ss.style, ss.extract_mode = "Keep", 1.0, "Accurate", "Average"
+    ss.crop_bars = True
+    r_crop = ss._extract(film)[0]
+    ss._prev, ss.crop_bars = None, False
+    r_raw = ss._extract(film)[0]
+    assert r_crop > 190 and r_raw < 160, f"bars should be ignored: {r_crop} vs {r_raw}"
+    halves = np.zeros((200, 320, 4), dtype=np.uint8)
+    halves[..., 3] = 255
+    halves[:, :160, 2] = 255                             # left half red (BGRA: index 2 = R)
+    halves[:, 160:, 0] = 255                             # right half blue
+    ss.crop_bars = False
+    for area, red_wins in (("Left", True), ("Right", False)):
+        ss._prev, ss.area = None, area
+        r, gg, b, _lvl = ss._extract(halves)
+        assert (r > 200 and b < 30) if red_wins else (b > 200 and r < 30), (area, r, gg, b)
+    ss._prev, ss.area = None, "Whole screen"
+    r, gg, b, _lvl = ss._extract(halves)
+    assert 100 < r < 160 and 100 < b < 160, "whole screen should blend both halves"
+    ss.calm = True
+    ss._prev, ss.alpha = np.array([0.0, 0.0, 0.0]), 1.0   # snappy setting, but Reduce flashing caps it
+    r, _gg, _b, _lvl = ss._extract(np.full((50, 80, 4), 255, dtype=np.uint8))
+    assert r < 100, f"Reduce flashing should cap sync reaction speed, got {r}"
+    print("OK  screen sync: black bars ignored, area picks the right side, calm caps reaction")
 
     # scenes: starters valid; a bad scene is dropped, good ones kept
     assert all(all(_valid_setting(f, sc[f]) for f in SCENE_FIELDS)
@@ -3273,6 +3833,43 @@ def _selftest():
             "after the alert: restore the steady color, then the held sync frame"
         assert not w._alert_on and not w._held, "alert state left behind"
 
+        # on-air: steady red for as long as onair_on holds; notifications and calls don't
+        # override it; releasing it puts the strip back
+        steady2 = cmd_color(7, 8, 9)
+
+        async def onair_run():
+            await w._write(steady2)
+            w.onair_on = True
+            task = asyncio.ensure_future(w._alert("onair", 100, max_s=30))
+            await asyncio.sleep(0.9)
+            assert w._alert_on and w._alert_kind == "onair"
+            await w._alert("notify", 100)               # ignored while on air
+            await w._alert("call", 100)                 # a ringing call doesn't override it
+            await w._alert("onair", 100)                # a second request is a no-op
+            assert w._alert_kind == "onair" and not task.done()
+            w.onair_on = False
+            await asyncio.wait_for(task, 3)
+        FakeClient.log.clear()
+        w.submit(onair_run()).result(timeout=10)
+        reds = [pl for pl in FakeClient.log if pl[2:4] == b"\x05\x03" and pl[4:7] == bytes((255, 0, 0))]
+        assert 1 <= len(reds) <= 4, f"steady red should need few writes, got {len(reds)}"
+        assert steady2 in FakeClient.log[-3:] and not w._alert_on, "strip not restored after on-air"
+        # an on-air request whose time has passed must not blip the strip
+        FakeClient.log.clear()
+        w.onair_on = False
+        w.submit(w._alert("onair", 100)).result(timeout=5)
+        assert not FakeClient.log, "stale on-air request wrote to the strip"
+
+        # color balance is applied on the wire only; what we remember stays uncorrected
+        w.balance = (1.0, 0.5, 1.0)
+        FakeClient.log.clear()
+        w.submit(w._write(cmd_color(200, 100, 50))).result(timeout=5)
+        assert FakeClient.log[-1][4:7] == bytes((200, 50, 50)), FakeClient.log[-1]
+        assert w.last_color() == (200, 100, 50), "remembered color must be pre-balance"
+        w.submit(w._write(cmd_on())).result(timeout=5)
+        assert FakeClient.log[-1] == cmd_on(), "non-color frames must pass through untouched"
+        w.balance = (1.0, 1.0, 1.0)
+
         # scan: normal = known strips only; everything = strips first, then closest
         got = w.submit(w._scan_all()).result(timeout=5)
         assert got == [("ELK-BLEDOM", "AA:01")], f"normal scan changed: {got}"
@@ -3285,6 +3882,16 @@ def _selftest():
         BleakClient, BleakScanner, ADDR_FILE = real, real_scanner, real_addr_file
     print("OK  BLE: single client under concurrent connects, reconnect, honours disconnect,"
           " strip switching, alert restore, all-devices scan")
+
+    # the feature modules carry their own checks: hotkeys (incl. a real Win32 round trip),
+    # On-Air detection, the OBS link against a fake OBS, the local API's security rules, the
+    # command-line tool end to end, fades / flash limiter, screen-sync helpers, Tools tab logic
+    import rgbzap_cli
+    import rgbzap_comfort
+    import rgbzap_sync
+    for mod in (hotkeys, onair_mod, obs_mod, api_mod, rgbzap_cli, rgbzap_comfort, rgbzap_sync,
+                rgbzap_tools):
+        mod._selftest()
 
 
 if __name__ == "__main__":
