@@ -138,8 +138,8 @@ rgbzap sync on|off|toggle      rgbzap audio on|off|toggle
 rgbzap flash green             # a short alert flash, then back to what it was
 ```
 
-`rgbzap.exe` is installed next to `RGBZap.exe`; tick *Add the rgbzap command to PATH* in
-the installer to use it from any terminal. It reads the port and secret token from RGBZap's
+`rgbzap.exe` is installed in the `cli` folder inside RGBZap's folder; tick *Add the rgbzap
+command to PATH* in the installer to use it from any terminal. It reads the port and secret token from RGBZap's
 settings, so there's nothing to set up. Exit code 0 means it worked.
 
 The same thing is a small HTTP API for other tools: `http://127.0.0.1:49732`, with the

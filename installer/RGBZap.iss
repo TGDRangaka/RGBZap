@@ -59,7 +59,7 @@ Root: HKCU; Subkey: "{#RunKey}"; ValueType: string; ValueName: "{#AppName}"; \
   ValueData: """{app}\{#AppExe}"""; Tasks: startup
 ; the per-user PATH, so `rgbzap color red` works in any new terminal (no admin needed)
 Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; \
-  ValueData: "{olddata};{app}"; Tasks: addpath; Check: NeedsAddPath(ExpandConstant('{app}'))
+  ValueData: "{olddata};{app}\cli"; Tasks: addpath; Check: NeedsAddPath(ExpandConstant('{app}\cli'))
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "Launch {#AppName}"; \
@@ -103,7 +103,7 @@ procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usPostUninstall then
   begin
-    RemoveFromPath(ExpandConstant('{app}'));
+    RemoveFromPath(ExpandConstant('{app}\cli'));
     RegDeleteValue(HKCU, '{#RunKey}', '{#AppName}');
     RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run',
                    '{#AppName}');

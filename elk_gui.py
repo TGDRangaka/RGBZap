@@ -76,7 +76,9 @@ ASSETS = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(_
 APP_VERSION = "1.2.0"
 APP_URL = "https://github.com/TGDRangaka/RGBZap"
 AUTHOR_URL = "https://dilshan-rangaka.vercel.app/"
-LOCK_PORT = 49731  # arbitrary localhost port used as a single-instance lock
+# arbitrary localhost port used as a single-instance lock (RGBZAP_LOCK_PORT lets tests run
+# a second, isolated copy next to a running one)
+LOCK_PORT = int(os.environ.get("RGBZAP_LOCK_PORT") or 49731)
 # Pace BLE writes to the strip's measured sustainable rate (~13/s ceiling).
 # 80ms => ~12.5/s, safely under the ceiling so the send buffer never backs up.
 SEND_INTERVAL = 0.08
