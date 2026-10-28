@@ -58,9 +58,10 @@ Bluetooth LE.
   for colors, scenes, effects, and the On-Air light. Optional start with Windows.
 
 <p align="center">
-  <img src="docs/screen.png" width="31%" alt="Screen tab: display, style, saturation, smoothing">
-  <img src="docs/audio.png" width="31%" alt="Audio tab: source, mode, live meter, sensitivity">
-  <img src="docs/system.png" width="31%" alt="System tab: start with Windows, notification and call alerts">
+  <img src="docs/screen.png" width="23%" alt="Screen tab: display, style, sample area, ignore black bars, saturation, smoothing">
+  <img src="docs/audio.png" width="23%" alt="Audio tab: source, mode, live meter, sensitivity">
+  <img src="docs/tools.png" width="23%" alt="Tools tab: hotkeys, On-Air light, OBS link, local control">
+  <img src="docs/system.png" width="23%" alt="System tab: start with Windows, lights off with the PC, alerts, comfort">
 </p>
 
 ## Install
