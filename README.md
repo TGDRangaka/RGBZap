@@ -3,7 +3,7 @@
 </p>
 
 <p align="center"><b>A free Windows desktop app for cheap Bluetooth LED strips.</b><br>
-Colors, effects, screen sync, music, hotkeys, On-Air light, OBS, notification alerts — no
+Colors, effects, screen sync, music, hotkeys, OBS, AI assistants, notification alerts — no
 phone, no hub, no account.</p>
 
 ---
@@ -35,8 +35,6 @@ Bluetooth LE.
 - **Global hotkeys** — turn the lights on/off, dim or brighten, switch scenes, and start or
   stop screen sync from anywhere, even in a full-screen game. Every shortcut is yours to
   change.
-- **On-Air light** — the strip turns red while your webcam (optionally your microphone) is
-  on, so the people around you know you're live. Switch it from the tray.
 - **OBS link** — red while you stream or record, and a different look for each OBS scene.
   Uses OBS's built-in WebSocket server (OBS 28+), no plugin.
 - **Command line & local API** — `rgbzap color red`, `rgbzap scene "Movie night"`. Drive
@@ -57,12 +55,12 @@ Bluetooth LE.
   Tick **Show all Bluetooth devices** and pick it from there.
 - **Update notices** — a banner tells you when a new version is out (optional, see Privacy).
 - **Lives in the tray** — close the window and it keeps running; right-click the tray icon
-  for colors, scenes, effects, and the On-Air light. Optional start with Windows.
+  for colors, scenes, effects, brightness, and screen sync. Optional start with Windows.
 
 <p align="center">
   <img src="docs/screen.png" width="23%" alt="Screen tab: display, style, sample area, ignore black bars, saturation, smoothing">
   <img src="docs/audio.png" width="23%" alt="Audio tab: source, mode, live meter, sensitivity">
-  <img src="docs/tools.png" width="23%" alt="Tools tab: hotkeys, On-Air light, OBS link, local control">
+  <img src="docs/tools.png" width="23%" alt="Tools tab: hotkeys, OBS link, local control">
   <img src="docs/system.png" width="23%" alt="System tab: start with Windows, lights off with the PC, alerts, comfort">
 </p>
 
@@ -120,12 +118,8 @@ If a shortcut doesn't work, another program already owns it — RGBZap tells you
 can pick a different one. Shortcuts need Ctrl, Alt or Win, so ordinary typing is never
 touched.
 
-## On-Air light and OBS
-**On-Air light** (Tools tab, or the tray menu): the strip goes red while your webcam is in
-use — tick *microphone* too if you want. When it ends, the strip returns to what it was
-showing. RGBZap only asks Windows *whether* the camera or mic is on; it never uses either.
-
-**OBS link**: in OBS turn on *Tools › WebSocket Server Settings › Enable WebSocket server*,
+## OBS link
+In OBS turn on *Tools › WebSocket Server Settings › Enable WebSocket server*,
 then tick **Connect to OBS** in RGBZap's Tools tab and enter the port and password. You
 can have the strip go red while you stream or record, and pick a RGBZap scene for each OBS
 scene with **Scene lighting…**. RGBZap only listens; it can't change anything in OBS.
@@ -196,8 +190,7 @@ downloads or installs anything by itself — if there's a new version you get a 
 download it yourself. Turn it off any time in **System › Updates**. Notification alerts
 are **off by default**; when you turn them on, RGBZap
 reads new notifications on your PC only to tell whether one arrived or a call is ringing —
-nothing is stored or sent anywhere. The **On-Air light** only reads the on/off state Windows
-keeps for the camera and microphone. The **local API** is off by default, only listens on
+nothing is stored or sent anywhere. The **local API** is off by default, only listens on
 this PC and needs a secret token. The **OBS link** talks only to an OBS on the host you
 enter (normally this PC). Global hotkeys register only the exact shortcuts you see in the
 Tools tab; RGBZap never sees other keys you press.
@@ -213,9 +206,6 @@ password, so treat that folder as private.
   it currently works for English-language notifications.
 - **Reduce flashing** switches off the strip's own *Blink* and *Jump* effects, because they
   run inside the strip where RGBZap can't soften them.
-- The On-Air light ignores RGBZap's own audio capture, so using Audio reactive never lights
-  it. Voice-chat apps use the microphone constantly, which is why the microphone option is
-  off by default.
 
 ## Build it yourself
 ```

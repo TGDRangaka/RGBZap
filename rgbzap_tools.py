@@ -1,10 +1,10 @@
-"""RGBZap's TOOLS tab: global hotkeys, the On-Air light, the OBS link, the local control
-API, and the strip's color balance.
+"""RGBZap's TOOLS tab: global hotkeys, the OBS link (incl. its red live light), the local
+control API, and the strip's color balance.
 
 The app hands this module itself (`app`) and its drawing theme (`app.ui`); this module
 never imports the main program. Everything that touches the lights goes through a few
 App methods (app.set_color, app.on_off, app.apply_scene, ...), always on the Tk thread:
-background threads (hotkeys, camera watcher, OBS, the API server) hop over with
+background threads (hotkeys, OBS, the API server) hop over with
 root.after().
 """
 import os
@@ -16,7 +16,6 @@ import tkinter as tk
 import rgbzap_api as api_mod
 import rgbzap_hotkeys as hotkeys
 import rgbzap_obs as obs_mod
-import rgbzap_onair as onair_mod
 
 _MODIFIER_KEYSYMS = {"Control_L", "Control_R", "Alt_L", "Alt_R", "Shift_L", "Shift_R",
                      "Win_L", "Win_R", "Super_L", "Super_R", "Meta_L", "Meta_R",
@@ -59,15 +58,8 @@ class ToolsTab:
         self.hk_on, self.hk = cfg["hotkeys_on"], dict(cfg["hotkeys"])
         self.hotkey_mgr = hotkeys.HotkeyManager(
             lambda action: self.root.after(0, self.app.run_hotkey, action))
-        # ---- On-Air: webcam / microphone, plus OBS going live
-        self.onair_enabled, self.onair_cam, self.onair_mic = (
-            cfg["onair"], cfg["onair_cam"], cfg["onair_mic"])
-        self._caps = {"cam": False, "mic": False}
+        # ---- OBS link (red light while streaming / recording)
         self._obs_state = (False, False)               # (streaming, recording)
-        self._test_until = 0.0
-        self.watcher = onair_mod.CapabilityWatcher(
-            lambda s: self.root.after(0, self._caps_update, s))
-        # ---- OBS link
         self.obs_on, self.obs_host, self.obs_port = cfg["obs_on"], cfg["obs_host"], cfg["obs_port"]
         self.obs_password = cfg["obs_password"]
         self.obs_live, self.obs_rec = cfg["obs_live"], cfg["obs_rec"]
@@ -138,25 +130,6 @@ class ToolsTab:
         self.hk_note.pack(fill="x")
         self._refresh_hotkey_labels({})
 
-        # ---- On-Air
-        app._heading(p, "On-Air light", pady=(18, 4), help=(
-            "Turns the strip red while your webcam (and, if you tick it, your microphone) "
-            "is in use, so people around you know you're live on a call or stream. "
-            "RGBZap only asks Windows whether the camera or mic is switched on. It never "
-            "uses the camera, hears audio, or sees which app is using them. When it "
-            "stops, the strip goes back to what it was showing."))
-        self.onair_var = tk.BooleanVar(value=self.onair_enabled)
-        self._check(p, "Show red while I'm on air", self.onair_var, self.on_onair_toggle)
-        self.cam_var = tk.BooleanVar(value=self.onair_cam)
-        self.mic_var = tk.BooleanVar(value=self.onair_mic)
-        self._check(p, "when my webcam is on", self.cam_var, self.on_onair_opts, indent=22)
-        self._check(p, "when my microphone is on", self.mic_var, self.on_onair_opts, indent=22,
-                    help="Off by default: voice chat apps like Discord use the microphone "
-                         "all the time, which would keep the strip red while you game.")
-        trow = tk.Frame(p, bg=ui.PANEL)
-        trow.pack(fill="x", pady=(6, 0))
-        app._flat(trow, "Test for 3 seconds", self.test_onair, pady=4).pack(side="left")
-
         # ---- OBS link
         app._heading(p, "OBS link", pady=(18, 4), help=(
             "Connects to OBS Studio (version 28 or newer) so the strip can follow your "
@@ -194,9 +167,10 @@ class ToolsTab:
         self.obs_status.pack(fill="x", pady=(6, 2))
         self.live_var = tk.BooleanVar(value=self.obs_live)
         self.rec_var = tk.BooleanVar(value=self.obs_rec)
-        self._check(p, "Red On-Air light while I'm streaming", self.live_var, self.on_obs_opts,
-                    help="The same red light as above, switched on by OBS going live.")
-        self._check(p, "Red On-Air light while I'm recording", self.rec_var, self.on_obs_opts)
+        self._check(p, "Red light while I'm streaming", self.live_var, self.on_obs_opts,
+                    help="The strip turns solid red while OBS is live, then goes back to "
+                         "what it was showing.")
+        self._check(p, "Red light while I'm recording", self.rec_var, self.on_obs_opts)
         srow = tk.Frame(p, bg=ui.PANEL)
         srow.pack(fill="x", pady=(6, 0))
         app._flat(srow, "Scene lighting…", self.edit_obs_scenes, pady=4).pack(side="left")
@@ -344,17 +318,14 @@ class ToolsTab:
         top.grab_set()
         top.focus_force()
 
-    # =============================================================== On-Air
+    # ============================================== red light while OBS is live
     def _want_onair(self):
-        cam_mic = self.onair_enabled and ((self.onair_cam and self._caps["cam"])
-                                          or (self.onair_mic and self._caps["mic"]))
-        obs = self.obs_on and ((self.obs_live and self._obs_state[0])
-                               or (self.obs_rec and self._obs_state[1]))
-        return bool(cam_mic or obs or self._test_until > time.monotonic())
+        return bool(self.obs_on and ((self.obs_live and self._obs_state[0])
+                                     or (self.obs_rec and self._obs_state[1])))
 
     def _onair_update(self):
-        """Light or release the red On-Air light to match what's happening. Safe to call
-        as often as you like (it's also a heartbeat)."""
+        """Light or release the steady red light to match OBS. Safe to call as often as
+        you like (it's also a heartbeat)."""
         ble = self.app.ble
         want = self._want_onair()
         ble.onair_on = want
@@ -362,40 +333,8 @@ class ToolsTab:
         if want and not running and ble._connected():
             ble.submit(ble._alert("onair", self.app.brightness, max_s=self.ui.ONAIR_MAX_S))
 
-    def _caps_update(self, state):
-        self._caps = state
-        self._onair_update()
-
     def on_strip_connected(self):
         self._onair_update()
-
-    def on_onair_toggle(self):
-        self.onair_enabled = self.onair_var.get()
-        if self.onair_enabled:
-            self.watcher.start()
-        else:
-            self.watcher.stop()
-            self._caps = {"cam": False, "mic": False}
-        self._onair_update()
-        self.app.set_status("On-Air light on" if self.onair_enabled else "On-Air light off")
-
-    def toggle_onair(self):
-        """From the tray menu."""
-        self.onair_var.set(not self.onair_enabled)
-        self.on_onair_toggle()
-
-    def on_onair_opts(self):
-        self.onair_cam, self.onair_mic = self.cam_var.get(), self.mic_var.get()
-        self._onair_update()
-
-    def test_onair(self):
-        if not self.app.ble._connected():
-            self.app.set_status("Connect a light strip first")
-            return
-        self._test_until = time.monotonic() + 3.0
-        self._onair_update()
-        self.root.after(3300, self._onair_update)         # release it after the test
-        self.app.set_status("On-Air test: red for 3 seconds")
 
     # ================================================================== OBS
     def _obs_apply(self):
@@ -439,7 +378,7 @@ class ToolsTab:
         self._onair_update()
         if streaming or recording:
             self.app.set_status("OBS is " + ("live" if streaming else "recording")
-                                + " - On-Air light")
+                                + " - red light on")
 
     def _obs_scene_list(self, names):
         self.obs_scene_names = list(names)
@@ -636,8 +575,6 @@ class ToolsTab:
                 n = len(failed)
                 self.app.set_status(f"{n} hotkey{'s' * (n != 1)} couldn't be set (another "
                                     "program uses them) - see the Tools tab")
-        if self.onair_enabled:
-            self.watcher.start()
         if self.obs_on:
             self._obs_apply()
             self.obs.start()
@@ -646,7 +583,6 @@ class ToolsTab:
 
     def stop(self):
         self.hotkey_mgr.stop()
-        self.watcher.stop()
         self.obs.stop()
         self.api.stop()
         self.app.ble.onair_on = False
@@ -655,8 +591,6 @@ class ToolsTab:
         """The settings this tab owns, for the app's settings file."""
         return {
             "hotkeys_on": self.hk_on, "hotkeys": dict(self.hk),
-            "onair": self.onair_enabled, "onair_cam": self.onair_cam,
-            "onair_mic": self.onair_mic,
             "obs_on": self.obs_on, "obs_host": self.obs_host, "obs_port": self.obs_port,
             "obs_password": self.obs_password, "obs_live": self.obs_live,
             "obs_rec": self.obs_rec, "obs_scenes": dict(self.obs_scenes),

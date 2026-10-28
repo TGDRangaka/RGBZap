@@ -45,7 +45,6 @@ from elk_protocol import (NAME_PREFIXES, EFFECTS, is_strip_name, pick_write_char
 import rgbzap_api as api_mod
 import rgbzap_hotkeys as hotkeys
 import rgbzap_obs as obs_mod
-import rgbzap_onair as onair_mod
 import rgbzap_session as session_mod
 import rgbzap_tools
 from rgbzap_comfort import FADES, FlashLimiter, apply_balance, fade_steps
@@ -74,7 +73,7 @@ ADDR_FILE = data_file("address.txt", legacy=os.path.join(_HERE, "elk_address.txt
 # logo / icons; inside the built exe they're unpacked under sys._MEIPASS
 ASSETS = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))),
                       "assets")
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 APP_URL = "https://github.com/TGDRangaka/RGBZap"
 AUTHOR_URL = "https://dilshan-rangaka.vercel.app/"
 # arbitrary localhost port used as a single-instance lock (RGBZAP_LOCK_PORT lets tests run
@@ -433,7 +432,7 @@ def is_call(text):
     return bool(_CALL_RE.search(text or ""))
 
 
-ONAIR_MAX_S = 24 * 3600                 # an On-Air light holds until the camera/mic/OBS stops
+ONAIR_MAX_S = 24 * 3600                 # the red "live" light holds until OBS stops
 ONAIR_RED = (255, 0, 0)
 
 
@@ -521,7 +520,6 @@ DEFAULT_SETTINGS = {
     "bal_r": 100, "bal_g": 100, "bal_b": 100,      # strip color balance (% gain per channel)
     "hotkeys_on": True,
     "hotkeys": {a: d for a, (_label, d) in HOTKEY_ACTIONS.items()},
-    "onair": False, "onair_cam": True, "onair_mic": False,   # red while camera / mic is on
     "obs_on": False, "obs_host": "localhost", "obs_port": 4455, "obs_password": "",
     "obs_live": True, "obs_rec": False,            # red while streaming / recording
     "obs_scenes": {},                   # OBS scene name -> RGBZap scene name
@@ -831,7 +829,7 @@ class BleWorker:
         self._alert_kind = None
         self._alert_lock = asyncio.Lock()
         self.alert_cancel = False            # set from any thread: stop the current alert
-        self.onair_on = False                # set from any thread: keep the On-Air light lit
+        self.onair_on = False                # set from any thread: keep the red live light lit
         self.frozen = False                  # True while the PC shuts down: writes are dropped
         self.calm = False                    # "Reduce flashing": gentler alerts
         self.balance = (1.0, 1.0, 1.0)       # per-channel gain, fixes a tinted "white"
@@ -2098,7 +2096,7 @@ class App:
                  ).pack(side="left")
         self._link(about, APP_URL.removeprefix("https://"), APP_URL).pack(anchor="w")
 
-        # ---- TOOLS tab: hotkeys, On-Air light, OBS link, local control, color balance
+        # ---- TOOLS tab: hotkeys, OBS link, local control, color balance
         self.tools = rgbzap_tools.ToolsTab(self, tools, cfg)
 
         # lock a consistent width; let height be resized (min keeps it usable)
@@ -2125,7 +2123,7 @@ class App:
         resume = (cfg["effect"], cfg["speed"]) if self.mode == "effect" else None
         self.ble.submit(self._launch(resume))
         self.root.after(2000, self._autosave)
-        self.tools.start()                    # hotkeys, On-Air watcher, OBS link, local API
+        self.tools.start()                    # hotkeys, OBS link, local API
         self.session.start()                  # hear Windows shut down / restart / sign out
         shutdown_log(f"RGBZap {APP_VERSION} started; shutdown listener "
                      f"{'ready' if self.session._hwnd else 'NOT created'}; lights-off-with-PC "
@@ -2423,7 +2421,7 @@ class App:
                 self._refresh_strips(addr)
             self._draw_link()
             if state and getattr(self, "tools", None) is not None:
-                self.tools.on_strip_connected()      # re-light On-Air if it's already on air
+                self.tools.on_strip_connected()      # re-light red if OBS is already live
         self.root.after(0, _apply)
 
     def send(self, payload):
@@ -3365,8 +3363,6 @@ class App:
                  checked=lambda _i: self.sync.running),
             Item("Audio reactive", act(self.on_toggle_audio),
                  checked=lambda _i: self.audio.running),
-            Item("On-Air light", act(self.tools.toggle_onair),
-                 checked=lambda _i: self.tools.onair_enabled),
             Menu.SEPARATOR,
             Item("Quit RGBZap", act(self.quit)),
         )
@@ -3566,7 +3562,7 @@ def _selftest():
     mine = {"fade": "Slow", "reduce_flash": True, "area": "Edges", "crop_bars": False,
             "bal_r": 90, "bal_g": 80, "bal_b": 100, "hotkeys_on": False,
             "hotkeys": {"toggle_power": "Alt+Ctrl+Home", "brightness_up": "", "bogus": "ctrl+alt+x"},
-            "onair": True, "onair_mic": True, "obs_on": True, "obs_host": "pc.local",
+            "obs_on": True, "obs_host": "pc.local",
             "obs_port": 4456, "obs_password": "pw",
             "obs_scenes": {"Game": "Focus", "": "x", "Bad": 5}, "api_on": True,
             "api_port": 50000, "api_token": "a" * 32}
@@ -3584,16 +3580,20 @@ def _selftest():
         ("pc.local", 4456, 50000, "a" * 32)
     junk = {"fade": "Warp", "area": "Everywhere", "bal_r": 10, "bal_g": 200, "obs_port": 0,
             "api_port": 80, "api_token": "not-hex", "hotkeys": {"toggle_power": "a"},
-            "obs_host": "x\n", "obs_scenes": [], "onair": "yes"}
+            "obs_host": "x\n", "obs_scenes": []}
     with open(p, "w") as f:
         json.dump(junk, f)
     got = load_settings(p)
     for k in ("fade", "area", "bal_r", "bal_g", "obs_port", "api_port", "api_token", "obs_host",
-              "obs_scenes", "onair"):
+              "obs_scenes"):
         assert got[k] == DEFAULT_SETTINGS[k], (k, got[k])
     assert got["hotkeys"]["toggle_power"] == DEFAULT_SETTINGS["hotkeys"]["toggle_power"]
     assert DEFAULT_SETTINGS["api_on"] is False and DEFAULT_SETTINGS["obs_on"] is False
-    assert DEFAULT_SETTINGS["onair"] is False and DEFAULT_SETTINGS["onair_mic"] is False
+    # settings files from 1.3.0 still carry the removed On-Air keys: they must be ignored
+    with open(p, "w") as f:
+        json.dump({"onair": True, "onair_cam": True, "onair_mic": True, "fade": "Slow"}, f)
+    got = load_settings(p)
+    assert got["fade"] == "Slow" and not any(k.startswith("onair") for k in got), got
     assert DEFAULT_SETTINGS["off_on_shutdown"] is True, "lights should go off with the PC"
     for raw, want in (({"off_on_shutdown": False}, False), ({"off_on_shutdown": "no"}, True)):
         with open(p, "w") as f:
@@ -4047,13 +4047,13 @@ def _selftest():
           " strip switching, alert restore, all-devices scan")
 
     # the feature modules carry their own checks: hotkeys (incl. a real Win32 round trip),
-    # On-Air detection, the OBS link against a fake OBS, the local API's security rules, the
-    # command-line tool end to end, fades / flash limiter, screen-sync helpers, Tools tab logic
+    # the OBS link against a fake OBS, the local API's security rules, the command-line tool
+    # and MCP server end to end, fades / flash limiter, screen-sync helpers, Tools tab logic
     import rgbzap_cli
     import rgbzap_comfort
     import rgbzap_mcp
     import rgbzap_sync
-    for mod in (hotkeys, onair_mod, obs_mod, api_mod, rgbzap_cli, rgbzap_mcp, rgbzap_comfort,
+    for mod in (hotkeys, obs_mod, api_mod, rgbzap_cli, rgbzap_mcp, rgbzap_comfort,
                 rgbzap_sync, session_mod, rgbzap_tools):
         mod._selftest()
 
