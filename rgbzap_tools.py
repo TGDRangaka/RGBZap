@@ -7,6 +7,8 @@ App methods (app.set_color, app.on_off, app.apply_scene, ...), always on the Tk 
 background threads (hotkeys, camera watcher, OBS, the API server) hop over with
 root.after().
 """
+import os
+import sys
 import threading
 import time
 import tkinter as tk
@@ -221,6 +223,14 @@ class ToolsTab:
         app._help(trow2, "The token is the password other programs must send. 'New token' "
                          "replaces it and locks out anything using the old one. The rgbzap "
                          "command line finds the token on its own."
+                  ).pack(side="left", padx=(8, 0))
+        mrow = tk.Frame(p, bg=ui.PANEL)
+        mrow.pack(fill="x", pady=(4, 0))
+        app._flat(mrow, "Copy AI assistant setup", self.copy_mcp_command, pady=4).pack(side="left")
+        app._help(mrow, "Lets an AI assistant such as Claude control your lights (scenes, "
+                        "colors, effects, brightness). Copies a one-line command; paste it "
+                        "in a terminal to add RGBZap to Claude Code. For other apps, use "
+                        "'rgbzap mcp' as the server command. Needs the switch above."
                   ).pack(side="left", padx=(8, 0))
         self._refresh_api_status()
 
@@ -518,6 +528,18 @@ class ToolsTab:
         self.root.clipboard_clear()
         self.root.clipboard_append(self.api_token)
         self.app.set_status("Token copied")
+
+    def copy_mcp_command(self):
+        import rgbzap_mcp
+        here = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False)
+                                               else __file__))
+        cmd = (rgbzap_mcp.add_command(os.path.join(here, "cli", "rgbzap.exe"))
+               if getattr(sys, "frozen", False)
+               else rgbzap_mcp.add_command(sys.executable, os.path.join(here, "rgbzap_cli.py")))
+        self.root.clipboard_clear()
+        self.root.clipboard_append(cmd)
+        self.app.set_status("Copied. Paste it in a terminal to add RGBZap to Claude Code"
+                            + ("" if self.api_on else " (and turn on the switch above)"))
 
     def new_token(self):
         self.api_token = api_mod.new_token()

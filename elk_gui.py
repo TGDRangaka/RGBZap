@@ -74,7 +74,7 @@ ADDR_FILE = data_file("address.txt", legacy=os.path.join(_HERE, "elk_address.txt
 # logo / icons; inside the built exe they're unpacked under sys._MEIPASS
 ASSETS = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))),
                       "assets")
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 APP_URL = "https://github.com/TGDRangaka/RGBZap"
 AUTHOR_URL = "https://dilshan-rangaka.vercel.app/"
 # arbitrary localhost port used as a single-instance lock (RGBZAP_LOCK_PORT lets tests run
@@ -4051,9 +4051,10 @@ def _selftest():
     # command-line tool end to end, fades / flash limiter, screen-sync helpers, Tools tab logic
     import rgbzap_cli
     import rgbzap_comfort
+    import rgbzap_mcp
     import rgbzap_sync
-    for mod in (hotkeys, onair_mod, obs_mod, api_mod, rgbzap_cli, rgbzap_comfort, rgbzap_sync,
-                session_mod, rgbzap_tools):
+    for mod in (hotkeys, onair_mod, obs_mod, api_mod, rgbzap_cli, rgbzap_mcp, rgbzap_comfort,
+                rgbzap_sync, session_mod, rgbzap_tools):
         mod._selftest()
 
 

@@ -41,6 +41,8 @@ Bluetooth LE.
   Uses OBS's built-in WebSocket server (OBS 28+), no plugin.
 - **Command line & local API** — `rgbzap color red`, `rgbzap scene "Movie night"`. Drive
   the lights from Stream Deck, AutoHotkey, scripts, or a build-status light. See below.
+- **AI assistants (MCP)** — let Claude or any MCP-capable assistant set colors, scenes and
+  effects ("warm and dim, I'm watching a film") or flash the strip when a long task ends.
 - **Notification & call alerts** — a quick flash when a notification arrives, a green
   pulse while a call rings (Phone Link, Teams, WhatsApp, Discord…), then the strip goes
   back to exactly what it was doing.
@@ -150,6 +152,22 @@ The same thing is a small HTTP API for other tools: `http://127.0.0.1:49732`, wi
 token as `Authorization: Bearer <token>` (Tools tab › *Copy token*), JSON bodies like
 `{"color": "red"}`. It only listens on your own PC, needs the token, refuses requests that
 come from web pages, and can only do what RGBZap's own buttons can.
+
+## AI assistants (MCP)
+`rgbzap mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server, so an AI
+assistant can use the same controls as the command line. Turn on **Let other programs
+control RGBZap** in the Tools tab, press **Copy AI assistant setup**, and paste the line into
+a terminal. For Claude Code it looks like:
+
+```
+claude mcp add rgbzap -- "C:\Users\you\AppData\Local\Programs\RGBZap\cli\rgbzap.exe" mcp
+```
+
+For other apps (Claude Desktop, Cursor…), add a stdio server whose command is that
+`rgbzap.exe` with the single argument `mcp`. The assistant gets ten tools: status, list,
+power, color, brightness, scene, effect, flash, screen sync and audio. It goes through the
+local API above, so it needs the switch on, only works on this PC, and can do only what
+RGBZap's own buttons can.
 
 ## Updating
 Versions from 1.0.1 on show a banner when a new release is out. Click it, download the new

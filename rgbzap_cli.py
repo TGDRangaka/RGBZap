@@ -7,6 +7,7 @@
     rgbzap sync on|off|toggle     rgbzap audio on|off|toggle
     rgbzap flash green            (a short alert flash, then back to what it was)
     rgbzap scenes | effects       (list what's available)
+    rgbzap mcp                    (MCP server so AI assistants can use all of the above)
 
 RGBZap must be running with "Let other programs control RGBZap" turned on (Tools tab).
 The port and secret token are read from RGBZap's settings file, so there is nothing to
@@ -113,6 +114,9 @@ def render(path, payload):
 
 def main(argv=None, env=None, out=print, urlopen=urllib.request.urlopen):
     argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["mcp"]:                    # MCP server for AI assistants (see rgbzap_mcp)
+        import rgbzap_mcp
+        return rgbzap_mcp.main()
     raw_json = "--json" in argv
     argv = [a for a in argv if a != "--json"]
     try:
