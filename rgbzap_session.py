@@ -17,6 +17,7 @@ if IS_WINDOWS:
 
 WM_CLOSE, WM_DESTROY = 0x0010, 0x0002
 WM_QUERYENDSESSION, WM_ENDSESSION = 0x0011, 0x0016
+ENDSESSION_CLOSEAPP = 0x1
 CLASS_NAME = "RGBZapSessionWatcher"
 
 
@@ -66,17 +67,22 @@ class SessionWatcher:
         kernel32.GetModuleHandleW.restype = wintypes.HINSTANCE
 
         def proc(hwnd, msg, wparam, lparam):
+            # ENDSESSION_CLOSEAPP: an installer / updater asking us to close for a moment
+            # (Windows Restart Manager). That isn't a shutdown, so the lights stay as they are.
+            real = not (lparam & ENDSESSION_CLOSEAPP)
             if msg == WM_QUERYENDSESSION:
-                try:
-                    self.on_query()
-                except Exception:               # never block the shutdown over our problem
-                    pass
+                if real:
+                    try:
+                        self.on_query()
+                    except Exception:           # never block the shutdown over our problem
+                        pass
                 return 1                        # TRUE: RGBZap doesn't object
             if msg == WM_ENDSESSION:
-                try:
-                    self.on_end(bool(wparam))
-                except Exception:
-                    pass
+                if real:
+                    try:
+                        self.on_end(bool(wparam))
+                    except Exception:
+                        pass
                 return 0
             if msg == WM_DESTROY:
                 user32.PostQuitMessage(0)
@@ -136,6 +142,11 @@ def _selftest():
     user32.SendMessageW(w._hwnd, WM_ENDSESSION, 1, 0x80000000)
     user32.SendMessageW(w._hwnd, WM_ENDSESSION, 0, 0)
     assert events == ["query", ("end", True), ("end", False)], events
+    # an installer asking us to close (Restart Manager) is not a shutdown: answer, do nothing
+    events.clear()
+    assert user32.SendMessageW(w._hwnd, WM_QUERYENDSESSION, 0, ENDSESSION_CLOSEAPP) == 1
+    user32.SendMessageW(w._hwnd, WM_ENDSESSION, 1, ENDSESSION_CLOSEAPP)
+    assert events == [], f"an installer close request must not look like a shutdown: {events}"
     # a handler that blows up must not stop the shutdown (still answers TRUE) or the loop
     w.on_query = lambda: 1 / 0
     assert user32.SendMessageW(w._hwnd, WM_QUERYENDSESSION, 0, 0) == 1

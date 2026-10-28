@@ -41,7 +41,7 @@ from bleak import BleakScanner, BleakClient
 
 from elk_protocol import (NAME_PREFIXES, EFFECTS, is_strip_name, pick_write_char,
                           cmd_on, cmd_off, cmd_color, cmd_effect, cmd_effect_speed,
-                          data_file)
+                          data_file, APP_DIR)
 import rgbzap_api as api_mod
 import rgbzap_hotkeys as hotkeys
 import rgbzap_obs as obs_mod
@@ -1173,18 +1173,24 @@ class BleWorker:
         self._set_connected(False)
         self.status_cb("Disconnected")
 
-    async def _shutdown_off(self):
+    async def _shutdown_off(self, quick=False):
         """The PC is shutting down (or signing out): stop everything that writes to the
-        strip, then switch it off. Sent twice a moment apart: a write-without-response can
-        be dropped, and we won't get another chance. unfreeze() undoes it if Windows
-        cancels the shutdown."""
+        strip, then switch it off. A write-without-response can be dropped and has to wait
+        for the radio's next slot, and we won't get another chance, so it goes out three
+        times and then we give the radio half a second to actually transmit before Windows
+        is told it may continue. quick=True is the last-chance resend (two writes, no wait).
+        Clearing `frozen` (shutdown cancelled) lets writes through again."""
         self.frozen = True
         self.alert_cancel, self.onair_on = True, False
         self._pending.clear()
-        if self._connected():
-            for _ in range(2):
-                await self._write(cmd_off(), track=False, force=True)
-                await asyncio.sleep(0.06)
+        if not self._connected():
+            return False
+        for _ in range(2 if quick else 3):
+            await self._write(cmd_off(), track=False, force=True)
+            await asyncio.sleep(0.05 if quick else 0.15)
+        if not quick:
+            await asyncio.sleep(0.5)
+        return True
 
     async def _write(self, payload, track=True, force=False):
         if self.frozen and not force:
@@ -1608,6 +1614,26 @@ class NotificationWatcher:
             calls &= notes.keys()
             seen = set(notes)
             await asyncio.sleep(1.0)
+
+
+SHUTDOWN_LOG = os.path.join(APP_DIR, "shutdown.log")
+
+
+def shutdown_log(msg, path=None):
+    """One timestamped line in %APPDATA%\\RGBZap\\shutdown.log (kept small). When Windows ends
+    the session RGBZap is killed moments later, so this file is the only way to see what
+    happened: whether it was told, whether the strip was connected, whether off went out."""
+    path = path or SHUTDOWN_LOG
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > 20000:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                keep = f.readlines()[-100:]
+            with open(path, "w", encoding="utf-8") as f:
+                f.writelines(keep)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S") + "  " + msg + "\n")
+    except OSError:
+        pass
 
 
 class Tooltip:
@@ -2101,6 +2127,9 @@ class App:
         self.root.after(2000, self._autosave)
         self.tools.start()                    # hotkeys, On-Air watcher, OBS link, local API
         self.session.start()                  # hear Windows shut down / restart / sign out
+        shutdown_log(f"RGBZap {APP_VERSION} started; shutdown listener "
+                     f"{'ready' if self.session._hwnd else 'NOT created'}; lights-off-with-PC "
+                     f"{'on' if self.off_on_shutdown else 'off'}")
         if self.update_check:                 # first look a few seconds after launch
             self._schedule_update_check(5000)
 
@@ -3384,17 +3413,33 @@ class App:
         """Windows is about to shut down, restart or sign out (watcher thread). Switch the
         strip off now, while Bluetooth is still up, and wait for the command to go out."""
         if not self.off_on_shutdown:
+            shutdown_log("session ending: 'lights off with the PC' is unticked, lights left alone")
             return
         self._shutdown_prev = self.light_on
+        t0 = time.monotonic()
+        shutdown_log(f"session ending: strip connected={self.ble._connected()}, "
+                     f"lights on={self.light_on}; sending off")
         try:
-            self.ble.submit(self.ble._shutdown_off()).result(timeout=2.5)
-        except Exception:
-            pass                              # never hold up the shutdown
+            sent = self.ble.submit(self.ble._shutdown_off()).result(timeout=2.5)
+            shutdown_log(f"off command {'sent' if sent else 'NOT sent (strip not connected)'} "
+                         f"({(time.monotonic() - t0) * 1000:.0f} ms)")
+        except Exception as e:
+            shutdown_log(f"off command FAILED: {e!r}")      # never hold up the shutdown
 
     def _on_session_end(self, ended):
-        if ended or not self.ble.frozen:
-            return                            # going down for real: nothing more to do
-        self.root.after(0, self._shutdown_cancelled)
+        """The verdict (watcher thread). Cancelled: lights back. Went ahead: one last off,
+        which is also the only message when Windows forces a shutdown through."""
+        shutdown_log("shutdown went ahead" if ended else "shutdown cancelled")
+        if ended:
+            if self.off_on_shutdown:
+                try:
+                    sent = self.ble.submit(self.ble._shutdown_off(quick=True)).result(timeout=1.5)
+                    shutdown_log("final off command " + ("sent" if sent else "NOT sent (not connected)"))
+                except Exception as e:
+                    shutdown_log(f"final off command FAILED: {e!r}")
+            return
+        if self.ble.frozen:
+            self.root.after(0, self._shutdown_cancelled)
 
     def _shutdown_cancelled(self):
         """Windows cancelled the shutdown (another program objected): lights back as they were."""
@@ -3950,9 +3995,16 @@ def _selftest():
         # strip afterwards, and unfreezing (shutdown cancelled) lets writes through again
         FakeClient.log.clear()
         w.onair_on = True
-        w.submit(w._shutdown_off()).result(timeout=5)
-        assert FakeClient.log == [cmd_off(), cmd_off()] and w.frozen, FakeClient.log
+        t_off = time.monotonic()
+        assert w.submit(w._shutdown_off()).result(timeout=5) is True
+        took = time.monotonic() - t_off
+        assert FakeClient.log == [cmd_off()] * 3 and w.frozen, FakeClient.log
+        assert 0.8 <= took < 2.0, f"should wait ~1 s for the radio before answering Windows, {took:.2f}s"
         assert not w.onair_on and w.alert_cancel, "alerts must stop for the shutdown"
+        FakeClient.log.clear()                           # the last-chance resend: quick, two writes
+        assert w.submit(w._shutdown_off(quick=True)).result(timeout=5) is True
+        assert FakeClient.log == [cmd_off()] * 2, FakeClient.log
+        FakeClient.log.clear()
         n = len(FakeClient.log)
         w.queue("color", cmd_color(1, 2, 3))
         w.submit(w._write(cmd_color(4, 5, 6))).result(timeout=5)
@@ -3961,6 +4013,25 @@ def _selftest():
         w.frozen = False
         w.submit(w._write(cmd_color(7, 8, 9))).result(timeout=5)
         assert FakeClient.log[-1] == cmd_color(7, 8, 9), "writes should resume after unfreeze"
+        w.client.is_connected = False                      # strip not connected: say so, don't hang
+        w._want_connected = False
+        assert w.submit(w._shutdown_off()).result(timeout=5) is False
+        w.frozen, w._want_connected = False, True
+        w.submit(w._connect()).result(timeout=5)
+
+        # the shutdown log: timestamped lines, and it never grows without bound
+        import tempfile as _tf
+        lp = os.path.join(_tf.mkdtemp(), "shutdown.log")
+        shutdown_log("session ending: test", lp)
+        shutdown_log("off command sent (900 ms)", lp)
+        lines = open(lp, encoding="utf-8").read().splitlines()
+        assert len(lines) == 2 and lines[0][4] == "-" and lines[0].endswith("session ending: test")
+        with open(lp, "a", encoding="utf-8") as f:
+            f.write(("x" * 99 + "\n") * 400)
+        shutdown_log("after trim", lp)
+        lines = open(lp, encoding="utf-8").read().splitlines()
+        assert len(lines) <= 102 and lines[-1].endswith("after trim"), len(lines)
+        shutdown_log("never raises", os.path.join(lp, "not", "a", "dir"))
 
         # scan: normal = known strips only; everything = strips first, then closest
         got = w.submit(w._scan_all()).result(timeout=5)
