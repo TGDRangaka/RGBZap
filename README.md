@@ -47,6 +47,9 @@ Bluetooth LE.
 - **Comfort** — colors **fade** into each other instead of snapping, and **Reduce
   flashing** softens fast effects, alerts and screen-sync cuts for anyone sensitive to
   flashing lights. A **color balance** control fixes strips whose "white" looks pink or blue.
+- **Lights off with your PC** — switches the strip off when you shut down, restart or sign
+  out (and brings it back if Windows cancels the shutdown). On by default; untick it in
+  **System** if you'd rather the strip stay as it is.
 - **Multiple strips** — scan, pick yours from a list, and RGBZap remembers it. Connects
   automatically on launch and reconnects by itself if the link drops. Strip not listed?
   Tick **Show all Bluetooth devices** and pick it from there.

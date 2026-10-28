@@ -46,6 +46,7 @@ import rgbzap_api as api_mod
 import rgbzap_hotkeys as hotkeys
 import rgbzap_obs as obs_mod
 import rgbzap_onair as onair_mod
+import rgbzap_session as session_mod
 import rgbzap_tools
 from rgbzap_comfort import FADES, FlashLimiter, apply_balance, fade_steps
 from rgbzap_sync import AREAS, crop_black_bars, select_area
@@ -513,6 +514,7 @@ DEFAULT_SETTINGS = {
     "strips": [],                       # user's light strips: [[name, address], ...]
     "notify_flash": False, "notify_call": False,   # alert on notifications / calls
     "update_check": True,               # ask GitHub for a newer release (notify only)
+    "off_on_shutdown": True,            # switch the lights off when the PC shuts down
     "fade": "Smooth",                   # how color changes blend: Off / Quick / Smooth / Slow
     "reduce_flash": False,              # soften flashing effects, alerts and sync cuts
     "area": "Whole screen", "crop_bars": True,     # screen sync: where to sample, skip bars
@@ -830,6 +832,7 @@ class BleWorker:
         self._alert_lock = asyncio.Lock()
         self.alert_cancel = False            # set from any thread: stop the current alert
         self.onair_on = False                # set from any thread: keep the On-Air light lit
+        self.frozen = False                  # True while the PC shuts down: writes are dropped
         self.calm = False                    # "Reduce flashing": gentler alerts
         self.balance = (1.0, 1.0, 1.0)       # per-channel gain, fixes a tinted "white"
         t = threading.Thread(target=self._run_loop, daemon=True)
@@ -898,6 +901,8 @@ class BleWorker:
         self.loop.call_soon_threadsafe(self._set_pending, channel, payload)
 
     def _set_pending(self, channel, payload):
+        if self.frozen:                      # the PC is shutting down: nothing may relight it
+            return
         if self._alert_on:                   # hold it: sent once the alert finishes
             self._held[channel] = payload
             return
@@ -1168,7 +1173,22 @@ class BleWorker:
         self._set_connected(False)
         self.status_cb("Disconnected")
 
-    async def _write(self, payload, track=True):
+    async def _shutdown_off(self):
+        """The PC is shutting down (or signing out): stop everything that writes to the
+        strip, then switch it off. Sent twice a moment apart: a write-without-response can
+        be dropped, and we won't get another chance. unfreeze() undoes it if Windows
+        cancels the shutdown."""
+        self.frozen = True
+        self.alert_cancel, self.onair_on = True, False
+        self._pending.clear()
+        if self._connected():
+            for _ in range(2):
+                await self._write(cmd_off(), track=False, force=True)
+                await asyncio.sleep(0.06)
+
+    async def _write(self, payload, track=True, force=False):
+        if self.frozen and not force:
+            return                           # shutting down: only the off command goes out
         if not self._connected():
             if not self._want_connected:
                 return                       # user disconnected: don't silently reconnect
@@ -1674,6 +1694,11 @@ class App:
             self._on_notification, lambda: setattr(self.ble, "alert_cancel", True),
             self.set_status)
 
+        # lights off with the PC: Windows' "session ending" messages arrive on this watcher
+        self.off_on_shutdown = cfg["off_on_shutdown"]
+        self._shutdown_prev = True          # were the lights on when the shutdown began?
+        self.session = session_mod.SessionWatcher(self._on_session_query, self._on_session_end)
+
         # comfort: fades, reduce flashing, strip color balance
         self.fade_name = cfg["fade"]
         self.reduce_flash = cfg["reduce_flash"]
@@ -1960,6 +1985,19 @@ class App:
                          self.startup_var, self.on_startup_toggle)
         if winreg is None:
             cb.config(state="disabled")  # non-Windows: not supported
+        self.shutdown_var = tk.BooleanVar(value=self.off_on_shutdown)
+        sdr = tk.Frame(system, bg=PANEL)
+        sdr.pack(fill="x")
+        tk.Checkbutton(sdr, text="Turn the lights off when this PC shuts down",
+                       variable=self.shutdown_var, command=self.on_shutdown_toggle,
+                       anchor="w", font=FONT_BODY, fg=TEXT, bg=PANEL, selectcolor=PANEL2,
+                       activebackground=PANEL, activeforeground=TEXT, highlightthickness=0,
+                       bd=0).pack(side="left")
+        self._help(sdr, "Switches the strip off when you shut down, restart or sign out of "
+                        "Windows, so it doesn't stay lit after the PC is off. RGBZap sends "
+                        "the off command just before Windows starts closing programs. If "
+                        "the shutdown gets cancelled, the lights come back as they were."
+                   ).pack(side="left", padx=(6, 0))
 
         # notification alerts: the strip flashes / pulses, then goes back to what it showed
         self._eyebrow(system, "Notifications").pack(fill="x", pady=(16, 4))
@@ -2062,6 +2100,7 @@ class App:
         self.ble.submit(self._launch(resume))
         self.root.after(2000, self._autosave)
         self.tools.start()                    # hotkeys, On-Air watcher, OBS link, local API
+        self.session.start()                  # hear Windows shut down / restart / sign out
         if self.update_check:                 # first look a few seconds after launch
             self._schedule_update_check(5000)
 
@@ -2148,7 +2187,7 @@ class App:
             "custom": [list(c) for c in self.custom],
             "strips": [list(s) for s in self.strips],
             "notify_flash": self.notify_flash, "notify_call": self.notify_call,
-            "update_check": self.update_check,
+            "update_check": self.update_check, "off_on_shutdown": self.off_on_shutdown,
             "fade": self.fade_name, "reduce_flash": self.reduce_flash,
             "area": self.sync.area, "crop_bars": self.sync.crop_bars,
             "bal_r": self.balance_pct[0], "bal_g": self.balance_pct[1],
@@ -3337,7 +3376,37 @@ class App:
                     return
         threading.Thread(target=run, daemon=True).start()
 
+    # ---- lights off with the PC ----
+    def on_shutdown_toggle(self):
+        self.off_on_shutdown = self.shutdown_var.get()
+
+    def _on_session_query(self):
+        """Windows is about to shut down, restart or sign out (watcher thread). Switch the
+        strip off now, while Bluetooth is still up, and wait for the command to go out."""
+        if not self.off_on_shutdown:
+            return
+        self._shutdown_prev = self.light_on
+        try:
+            self.ble.submit(self.ble._shutdown_off()).result(timeout=2.5)
+        except Exception:
+            pass                              # never hold up the shutdown
+
+    def _on_session_end(self, ended):
+        if ended or not self.ble.frozen:
+            return                            # going down for real: nothing more to do
+        self.root.after(0, self._shutdown_cancelled)
+
+    def _shutdown_cancelled(self):
+        """Windows cancelled the shutdown (another program objected): lights back as they were."""
+        self.ble.frozen = False
+        if self._shutdown_prev:
+            self.on_on()
+            if self.mode == "effect" and self.effect_var.get() in EFFECTS and self.soft is None:
+                self.on_effect()              # the strip's own effects need starting again
+        self.set_status("Shutdown cancelled - lights restored")
+
     def quit(self):
+        self.session.stop()
         self.tools.stop()                     # release hotkeys, close the API port, stop OBS
         if self._tray is not None:
             self._tray.visible = False        # stop() alone leaves a ghost icon on Windows
@@ -3480,6 +3549,11 @@ def _selftest():
     assert got["hotkeys"]["toggle_power"] == DEFAULT_SETTINGS["hotkeys"]["toggle_power"]
     assert DEFAULT_SETTINGS["api_on"] is False and DEFAULT_SETTINGS["obs_on"] is False
     assert DEFAULT_SETTINGS["onair"] is False and DEFAULT_SETTINGS["onair_mic"] is False
+    assert DEFAULT_SETTINGS["off_on_shutdown"] is True, "lights should go off with the PC"
+    for raw, want in (({"off_on_shutdown": False}, False), ({"off_on_shutdown": "no"}, True)):
+        with open(p, "w") as f:
+            json.dump(raw, f)
+        assert load_settings(p)["off_on_shutdown"] is want, raw
     assert not hotkeys.find_conflicts(DEFAULT_SETTINGS["hotkeys"]), "default shortcuts clash"
     assert all(hotkeys.normalize(c) for c in DEFAULT_SETTINGS["hotkeys"].values() if c)
     print("OK  settings: comfort/tools values validated; risky features default off; default "
@@ -3872,6 +3946,22 @@ def _selftest():
         assert FakeClient.log[-1] == cmd_on(), "non-color frames must pass through untouched"
         w.balance = (1.0, 1.0, 1.0)
 
+        # shutdown: off goes out (twice, in case one is dropped), nothing can relight the
+        # strip afterwards, and unfreezing (shutdown cancelled) lets writes through again
+        FakeClient.log.clear()
+        w.onair_on = True
+        w.submit(w._shutdown_off()).result(timeout=5)
+        assert FakeClient.log == [cmd_off(), cmd_off()] and w.frozen, FakeClient.log
+        assert not w.onair_on and w.alert_cancel, "alerts must stop for the shutdown"
+        n = len(FakeClient.log)
+        w.queue("color", cmd_color(1, 2, 3))
+        w.submit(w._write(cmd_color(4, 5, 6))).result(timeout=5)
+        time.sleep(0.3)                                   # let the writer have its chance
+        assert len(FakeClient.log) == n, "something wrote to the strip after the freeze"
+        w.frozen = False
+        w.submit(w._write(cmd_color(7, 8, 9))).result(timeout=5)
+        assert FakeClient.log[-1] == cmd_color(7, 8, 9), "writes should resume after unfreeze"
+
         # scan: normal = known strips only; everything = strips first, then closest
         got = w.submit(w._scan_all()).result(timeout=5)
         assert got == [("ELK-BLEDOM", "AA:01")], f"normal scan changed: {got}"
@@ -3892,7 +3982,7 @@ def _selftest():
     import rgbzap_comfort
     import rgbzap_sync
     for mod in (hotkeys, onair_mod, obs_mod, api_mod, rgbzap_cli, rgbzap_comfort, rgbzap_sync,
-                rgbzap_tools):
+                session_mod, rgbzap_tools):
         mod._selftest()
 
 
